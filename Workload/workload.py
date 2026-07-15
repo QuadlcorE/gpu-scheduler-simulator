@@ -17,12 +17,37 @@ from dataclasses import dataclass, field
 import torch
 
 
+# ---------------------------------------------------------------------------
+# Workload types -- three fixed presets so a run has a mix of job "sizes".
+#
+# Each type pins the matrix dimension (compute grows ~N^3) and the range the
+# iteration count is drawn from. The sizes are chosen so "heavy" visibly takes
+# seconds while "light" is near-instant; recalibrate per machine if needed.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WorkloadType:
+    name: str          # "light" / "medium" / "heavy"
+    label: str         # single-letter tag for compact UI ("L" / "M" / "H")
+    size: int          # NxN matrix dimension for the GEMM
+    iter_range: tuple  # (min, max) matmul iterations, inclusive
+
+
+LIGHT = WorkloadType("light", "L", 128, (10, 30))
+MEDIUM = WorkloadType("medium", "M", 384, (10, 30))
+HEAVY = WorkloadType("heavy", "H", 768, (5, 15))
+
+# Lookup by name; also the canonical light->medium->heavy ordering.
+WORKLOAD_TYPES = {w.name: w for w in (LIGHT, MEDIUM, HEAVY)}
+
+
 @dataclass
 class Job:
     job_id: int
     tenant_id: str
     size: int                 # NxN matrix dimension for the GEMM
     iters: int                # number of matmul iterations
+    wtype: str = "medium"     # workload type name (key into WORKLOAD_TYPES)
     submit_time: float = 0.0  # when the job arrived (real seconds)
     metrics: dict = field(default_factory=dict)  # filled in by run()
 
@@ -54,28 +79,31 @@ class Job:
 
 
 class Tenant:
-    # The pool of matrix sizes a tenant's random jobs are drawn from.
-    SIZES = (128, 256, 384, 512)
-
-    def __init__(self, tenant_id, arrival_rate, color="#e0e0e0",
-                 sizes=None, iter_range=(10, 50)):
+    def __init__(self, tenant_id, arrival_rate, color="#e0e0e0"):
         self.tenant_id = tenant_id
         self.arrival_rate = arrival_rate      # mean jobs per real second
         self.color = color
-        self.sizes = sizes or self.SIZES
-        self.iter_range = iter_range
 
     def next_interarrival(self):
         """Random gap (real seconds) until this tenant submits its next job."""
         return random.expovariate(self.arrival_rate)
 
-    def make_job(self, job_id, submit_time):
-        """Create the next random matmul workload for this tenant."""
+    def make_job(self, job_id, submit_time, wtype=None):
+        """Create the next matmul workload for this tenant.
+
+        `wtype` selects the workload type (a WorkloadType, its name, or None
+        to pick one at random); the type fixes the matrix size and the range
+        the iteration count is drawn from."""
+        if wtype is None:
+            wtype = random.choice(list(WORKLOAD_TYPES.values()))
+        elif isinstance(wtype, str):
+            wtype = WORKLOAD_TYPES[wtype]
         return Job(
             job_id=job_id,
             tenant_id=self.tenant_id,
-            size=random.choice(self.sizes),
-            iters=random.randint(*self.iter_range),
+            size=wtype.size,
+            iters=random.randint(*wtype.iter_range),
+            wtype=wtype.name,
             submit_time=submit_time,
         )
 

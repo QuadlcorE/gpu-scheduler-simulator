@@ -22,9 +22,10 @@ The simulation engine calls:
 
     scheduler.select_server(job, servers) -> int | None
 
-`job` is the pending Workload.Job (so `job.tenant_id`, `job.size`, `job.iters`
-are all available to inform placement). `servers` is a list of dicts, one per
-server slot, ordered by index:
+`job` is the pending Workload.Job (so `job.tenant_id`, `job.wtype`
+(light/medium/heavy), `job.size`, `job.iters` are all available to inform
+placement). `servers` is a list of dicts, one per server slot, ordered by
+index:
 
     {"index": int, "free": bool, "tenant": str | None, "queue_len": int}
 

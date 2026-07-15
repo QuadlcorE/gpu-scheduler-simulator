@@ -127,7 +127,7 @@ class MultiTenantSimulation:
                 self.pending.append(job)
                 self.active_jobs[job.job_id] = {
                     "job_id": job.job_id, "tenant": job.tenant_id,
-                    "size": job.size, "iters": job.iters,
+                    "size": job.size, "iters": job.iters, "wtype": job.wtype,
                     "state": "queued", "gpu": None,
                 }
             self._snapshot()

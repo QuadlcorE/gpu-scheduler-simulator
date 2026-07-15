@@ -5,7 +5,7 @@ import threading
 
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
-from Workload.workload import DEFAULT_TENANTS
+from Workload.workload import DEFAULT_TENANTS, WORKLOAD_TYPES
 from Scheduling_control.loader import load_schedulers
 
 class Dashboard(tk.Tk):
@@ -98,11 +98,12 @@ class Dashboard(tk.Tk):
         frame = ttk.LabelFrame(self, text="Job Queue  (generated jobs and their assigned GPU)")
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        cols = ("job", "tenant", "size", "iters", "state", "gpu")
-        headings = {"job": "Job #", "tenant": "Tenant", "size": "Matrix",
-                    "iters": "Iters", "state": "State", "gpu": "GPU"}
-        widths = {"job": 60, "tenant": 90, "size": 80, "iters": 60,
-                  "state": 90, "gpu": 60}
+        cols = ("job", "tenant", "type", "size", "iters", "state", "gpu")
+        headings = {"job": "Job #", "tenant": "Tenant", "type": "Type",
+                    "size": "Matrix", "iters": "Iters", "state": "State",
+                    "gpu": "GPU"}
+        widths = {"job": 60, "tenant": 90, "type": 70, "size": 80,
+                  "iters": 60, "state": 90, "gpu": 60}
 
         self.queue_tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
         for c in cols:
@@ -223,7 +224,15 @@ class Dashboard(tk.Tk):
 
     def _render_snapshot(self, snap):
         self.sim_time_var.set(f"t = {snap['sim_time']:.2f}")
-        self._draw_grid(snap["capacity"], snap["gpu_owner"])
+        # Map each busy GPU to the one-letter tag of the workload running on it,
+        # so the grid box shows both who owns the GPU (color) and what it's
+        # running (letter).
+        gpu_types = {}
+        for j in snap.get("jobs", []):
+            if j.get("gpu") is not None and j.get("state") == "running":
+                wt = WORKLOAD_TYPES.get(j.get("wtype"))
+                gpu_types[j["gpu"]] = wt.label if wt else "?"
+        self._draw_grid(snap["capacity"], snap["gpu_owner"], gpu_types)
         for tenant_id, s in snap["tenant_stats"].items():
             if tenant_id in self.tenant_vars:
                 self.tenant_vars[tenant_id].set(
@@ -240,12 +249,14 @@ class Dashboard(tk.Tk):
             gpu = j["gpu"]
             tree.insert(
                 "", "end",
-                values=(j["job_id"], j["tenant"], f"{j['size']}²", j["iters"],
-                        j["state"], "—" if gpu is None else gpu),
+                values=(j["job_id"], j["tenant"], (j.get("wtype") or "—").capitalize(),
+                        f"{j['size']}²", j["iters"], j["state"],
+                        "—" if gpu is None else gpu),
                 tags=(j["tenant"],),
             )
 
-    def _draw_grid(self, capacity, gpu_owner):
+    def _draw_grid(self, capacity, gpu_owner, gpu_types=None):
+        gpu_types = gpu_types or {}
         self.grid_canvas.delete("all")
         pad = 6
         for gpu_id in range(capacity):
@@ -256,9 +267,16 @@ class Dashboard(tk.Tk):
             x1, y1 = x0 + self.BOX, y0 + self.BOX
             tenant_id = gpu_owner.get(gpu_id)
             color = self.tenant_colors.get(tenant_id, "#e0e0e0")  # gray = idle
+            fg = "white" if tenant_id else "black"
             self.grid_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#999999")
-            self.grid_canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=str(gpu_id),
-                                          fill="white" if tenant_id else "black")
+            # GPU id near the top, workload-type letter (L/M/H) below it.
+            self.grid_canvas.create_text((x0 + x1) / 2, y0 + self.BOX * 0.33,
+                                         text=str(gpu_id), fill=fg)
+            letter = gpu_types.get(gpu_id)
+            if letter:
+                self.grid_canvas.create_text((x0 + x1) / 2, y0 + self.BOX * 0.68,
+                                             text=letter, fill=fg,
+                                             font=("TkDefaultFont", 12, "bold"))
         rows_needed = (capacity + self.GRID_COLS - 1) // self.GRID_COLS
         self.grid_canvas.configure(height=max(80, rows_needed * (self.BOX + pad) + pad))
 
