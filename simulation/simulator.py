@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from Scheduling_control.scheduler import PooledScheduler
+from Scheduling_control.scheduler import Scheduler
 from Workload.workload import DEFAULT_TENANTS
 
 
@@ -33,6 +33,19 @@ class SimEvent:
     sim_time: float
     kind: str  # "job_start" | "job_end"
     payload: dict = field(default_factory=dict)
+
+
+class _DefaultScheduler(Scheduler):
+    """Fallback used when the caller supplies no scheduler: any free server.
+
+    Keeps the engine runnable on its own (e.g. in tests) without depending on
+    the schedulers/ plugin directory being present."""
+
+    def select_server(self, job, servers):
+        for s in servers:
+            if s["free"]:
+                return s["index"]
+        return None
 
 
 def _device_for(index: int) -> "torch.device":
@@ -79,7 +92,7 @@ class MultiTenantSimulation:
         self.event_q, self.stop_flag = event_q, stop_flag
         self.capacity = capacity
         self.tenants = list(tenants)
-        self.scheduler = scheduler or PooledScheduler()
+        self.scheduler = scheduler or _DefaultScheduler()
 
         self._job_ids = itertools.count()
         self._t0 = time.perf_counter()
@@ -134,8 +147,16 @@ class MultiTenantSimulation:
         with self._lock:
             if not self.pending or not self.free:
                 return
+            # queue_len is 0 for an idle server and 1 for a busy one today
+            # (each server runs a single job at a time); it becomes a real
+            # per-server queue depth once server-side queuing lands.
             view = [
-                {"index": i, "free": i in self.free, "tenant": self.owner.get(i)}
+                {
+                    "index": i,
+                    "free": i in self.free,
+                    "tenant": self.owner.get(i),
+                    "queue_len": 0 if i in self.free else 1,
+                }
                 for i in range(self.capacity)
             ]
             still_pending = deque()
@@ -149,6 +170,7 @@ class MultiTenantSimulation:
                     self.stats[job.tenant_id]["running"] += 1
                     view[idx]["free"] = False
                     view[idx]["tenant"] = job.tenant_id
+                    view[idx]["queue_len"] = 1
                     rec = self.active_jobs.get(job.job_id)
                     if rec is not None:
                         rec["state"] = "running"

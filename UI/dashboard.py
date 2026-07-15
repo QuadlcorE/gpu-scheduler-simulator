@@ -6,18 +6,11 @@ import threading
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
 from Workload.workload import DEFAULT_TENANTS
-from Scheduling_control.scheduler import PooledScheduler, PinnedScheduler
+from Scheduling_control.loader import load_schedulers
 
 class Dashboard(tk.Tk):
     GRID_COLS = 8
     BOX = 50  # px per GPU box in the grid
-
-    # Scheduling algorithms the user can pick; each decides how tenants map
-    # to GPUs/servers. A fresh instance is created per run (some are stateful).
-    SCHEDULERS = {
-        "Pooled (any free GPU)": PooledScheduler,
-        "Pinned (tenant to GPU)": PinnedScheduler,
-    }
 
     def __init__(self):
         super().__init__()
@@ -27,6 +20,12 @@ class Dashboard(tk.Tk):
         self.event_q = None
         self.stop_flag = None
         self.worker = None
+
+        # Scheduling algorithms the user can pick; each decides how tenants map
+        # to GPUs/servers. Discovered from the schedulers/ plugin directory and
+        # refreshable at runtime via the "Reload schedulers" button. A fresh
+        # instance is created per run (some are stateful).
+        self.schedulers = load_schedulers()
 
         # Tenants that generate the simulated workload, plus a color lookup
         # used to shade the GPU grid by owning tenant.
@@ -53,12 +52,16 @@ class Dashboard(tk.Tk):
         self.gpu_spinbox.pack(side="left", padx=5)
 
         ttk.Label(frame, text="Scheduler:").pack(side="left", padx=(15, 5))
-        self.scheduler_var = tk.StringVar(value=next(iter(self.SCHEDULERS)))
+        self.scheduler_var = tk.StringVar()
         self.scheduler_combo = ttk.Combobox(
-            frame, textvariable=self.scheduler_var, state="readonly", width=22,
-            values=list(self.SCHEDULERS),
+            frame, textvariable=self.scheduler_var, state="readonly", width=28,
         )
         self.scheduler_combo.pack(side="left", padx=5)
+        self._refresh_scheduler_combo()
+
+        self.reload_btn = ttk.Button(frame, text="Reload schedulers",
+                                     command=self._reload_schedulers)
+        self.reload_btn.pack(side="left", padx=5)
 
         self.start_btn = ttk.Button(frame, text="Start Simulation", command=self._start_simulation)
         self.start_btn.pack(side="left", padx=5)
@@ -67,7 +70,22 @@ class Dashboard(tk.Tk):
         
         self.status_var = tk.StringVar(value="Simulation not started. -- Choose GPU count and click 'Start'")
         ttk.Label(frame, textvariable=self.status_var).pack(side="left", padx=10)
-        
+
+    def _refresh_scheduler_combo(self):
+        """Point the dropdown at the current self.schedulers, preserving the
+        user's selection when that scheduler still exists."""
+        names = list(self.schedulers)
+        self.scheduler_combo["values"] = names
+        if self.scheduler_var.get() not in self.schedulers:
+            self.scheduler_var.set(names[0] if names else "")
+
+    def _reload_schedulers(self):
+        """Rescan the schedulers/ directory so newly written or edited plugins
+        appear without restarting the app."""
+        self.schedulers = load_schedulers()
+        self._refresh_scheduler_combo()
+        self.status_var.set(f"Loaded {len(self.schedulers)} scheduler(s) from schedulers/")
+
     def _build_gpu_grid_panel(self):
         frame = ttk.LabelFrame(self, text="GPU Grid")
         frame.pack(fill="x", padx=10, pady=(0, 10))
@@ -142,6 +160,7 @@ class Dashboard(tk.Tk):
         self.gpu_spinbox.config(state=state)
         # readonly combobox re-enables to "readonly", not plain NORMAL
         self.scheduler_combo.config(state="readonly" if enabled else tk.DISABLED)
+        self.reload_btn.config(state=state)
         self.start_btn.config(state=state)
         self.stop_btn.config(state=tk.NORMAL if not enabled else tk.DISABLED)
         
@@ -155,7 +174,11 @@ class Dashboard(tk.Tk):
             self.status_var.set("GPU count must be at least 1")
             return
 
-        scheduler = self.SCHEDULERS[self.scheduler_var.get()]()
+        name = self.scheduler_var.get()
+        if name not in self.schedulers:
+            self.status_var.set("No scheduler selected -- add one to schedulers/ and click 'Reload schedulers'")
+            return
+        scheduler = self.schedulers[name]()
 
         self._set_controls_enabled(False)
         self.status_var.set(f"Running with {capacity} GPU(s) -- {self.scheduler_var.get()}")
