@@ -486,12 +486,13 @@ class MultiTenantSimulation:
         self._completions.put(job.job_id)
 
     def build_summary(self):
-        """Return the per-run summary over the results log (see
-        simulation.results.summarize). Safe to call after run() completes."""
+        """Return the per-run summary over the results log and the telemetry
+        timeline (see simulation.results.summarize -- covers all seven §3.9
+        metrics). Safe to call after run() completes."""
         with self._lock:
             results = list(self.results)
             capacity = self.capacity
-        return summarize(results, capacity)
+        return summarize(results, capacity, self.telemetry.samples)
 
     def _is_complete(self):
         """The run is done once every trace job has finished. total_jobs is
@@ -582,7 +583,8 @@ class MultiTenantSimulation:
             # without reaching back into the simulator thread.
             if done:
                 payload["results"] = list(self.results)
-                payload["summary"] = summarize(list(self.results), self.capacity)
+                payload["summary"] = summarize(list(self.results), self.capacity,
+                                               self.telemetry.samples)
                 # Full decision/throttle history, so the UI can export the
                 # admission-log CSV without reaching into the simulator thread.
                 payload["admission_log"] = list(self.admission.log)

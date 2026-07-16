@@ -1,3 +1,4 @@
+import os
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import queue
@@ -5,7 +6,7 @@ import threading
 
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
-from simulation.results import write_results_csv
+from simulation.results import export_run
 from Workload.workload import WORKLOAD_TYPES, make_tenants, generate_trace
 from Scheduling_control.loader import load_schedulers
 
@@ -23,11 +24,17 @@ class Dashboard(tk.Tk):
         self.worker = None
         self._user_stopped = False
 
-        # Results of the most recent completed run: the raw per-job rows (for
-        # CSV export) and the folded summary (for the results view). Filled from
-        # the engine's final done=True snapshot; a label identifies the run.
+        # Artifacts of the most recent completed run: the raw per-job rows,
+        # the admission/throttle logs, the measured telemetry timeline (all
+        # for CSV export) and the folded summary (for the results view).
+        # Filled from the engine's final done=True snapshot; a label
+        # identifies the run.
         self.last_results = []
         self.last_summary = None
+        self.last_admission_log = []
+        self.last_throttle_log = []
+        self.last_telemetry = []
+        self.last_capacity = 1
         self._last_run_label = "run"
 
         # Scheduling algorithms the user can pick; each decides how tenants map
@@ -284,11 +291,15 @@ class Dashboard(tk.Tk):
         jobs = generate_trace(self.tenants, counts, seed)
 
         self._user_stopped = False
-        # Drop the previous run's results so a run that finishes without any
+        # Drop the previous run's artifacts so a run that finishes without any
         # completed jobs can't re-show stale numbers. Label this run for the
         # default CSV filename (sanitized: no spaces/parens).
         self.last_results = []
         self.last_summary = None
+        self.last_admission_log = []
+        self.last_throttle_log = []
+        self.last_telemetry = []
+        self.last_capacity = capacity
         safe_name = "".join(c if c.isalnum() else "_" for c in name).strip("_")
         self._last_run_label = f"{safe_name}_seed{seed}"
         self._set_controls_enabled(False)
@@ -351,6 +362,23 @@ class Dashboard(tk.Tk):
                   f"Total compute: {s['total_run_s']:.2f}s"),
             font=("TkDefaultFont", 10, "bold"),
         ).pack(anchor="w")
+        # Second headline row: the remaining §3.9 metrics. The measured NVML
+        # figures are None on CPU-only machines, so they render as "n/a".
+        nvml_util = s.get("gpu_util_nvml_mean")
+        vram_util = s.get("vram_util_mean")
+        ttk.Label(
+            head,
+            text=(f"Throughput: {s.get('throughput_jps', 0.0):.2f} jobs/s      "
+                  f"OOM rate: {s.get('oom_rate', 0.0) * 100:.1f}% "
+                  f"({s.get('oom_count', 0)} OOM, {s.get('rejected', 0)} rejected)      "
+                  f"Fairness (wait/service): {s.get('fairness_wait', 1.0):.3f} / "
+                  f"{s.get('fairness_service', 1.0):.3f}      "
+                  f"Measured util: "
+                  f"{'n/a' if nvml_util is None else f'{nvml_util:.1f}%'}      "
+                  f"Avg VRAM: "
+                  f"{'n/a' if vram_util is None else f'{vram_util * 100:.1f}%'}"),
+            foreground="#555555",
+        ).pack(anchor="w", pady=(2, 0))
 
         table = ttk.LabelFrame(win, text="Per-tenant averages")
         table.pack(fill="both", expand=True, padx=12, pady=6)
@@ -376,25 +404,31 @@ class Dashboard(tk.Tk):
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
 
     def _export_csv(self):
-        """Write the last run's per-job rows to a user-chosen CSV file. This is
-        the artifact compared across seeded runs / schedulers."""
+        """Export the last run's full CSV artifact set (jobs, admission log,
+        throttle log, telemetry, summary) into a run directory under a
+        user-chosen location. These are the artifacts compared across seeded
+        runs / schedulers."""
         if not self.last_results:
             messagebox.showinfo("Nothing to export", "No completed jobs in the last run.")
             return
-        path = filedialog.asksaveasfilename(
-            title="Export run results",
-            defaultextension=".csv",
-            initialfile=f"results_{self._last_run_label}.csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
+        parent = filedialog.askdirectory(title="Choose where to save the run's CSVs")
+        if not parent:
             return
+        run_dir = os.path.join(parent, f"results_{self._last_run_label}")
         try:
-            n = write_results_csv(path, self.last_results)
+            paths = export_run(
+                run_dir, self.last_results, self.last_capacity,
+                admission_log=self.last_admission_log,
+                throttle_log=self.last_throttle_log,
+                telemetry=self.last_telemetry,
+                summary=self.last_summary,
+            )
         except OSError as exc:
             messagebox.showerror("Export failed", str(exc))
             return
-        messagebox.showinfo("Export complete", f"Wrote {n} job row(s) to\n{path}")
+        names = ", ".join(os.path.basename(p) for p in paths.values())
+        messagebox.showinfo("Export complete",
+                            f"Wrote {len(paths)} file(s) ({names}) to\n{run_dir}")
 
     # ---- simulation snapshot polling / rendering ----
     def _poll_sim_queue(self):
@@ -425,11 +459,16 @@ class Dashboard(tk.Tk):
 
     def _render_snapshot(self, snap):
         self.sim_time_var.set(f"t = {snap['sim_time']:.2f}")
-        # The engine's final snapshot carries the results log and summary; stash
+        # The engine's final snapshot carries the results log, the admission/
+        # throttle logs, the telemetry timeline, and the folded summary; stash
         # them so the run can be exported/summarized once the worker exits.
         if snap.get("done"):
             self.last_results = snap.get("results", [])
             self.last_summary = snap.get("summary")
+            self.last_admission_log = snap.get("admission_log", [])
+            self.last_throttle_log = snap.get("throttle_log", [])
+            self.last_telemetry = snap.get("telemetry", [])
+            self.last_capacity = snap.get("capacity", self.last_capacity)
         # Map each busy GPU to the one-letter tag of the workload running on it,
         # so the grid box shows both who owns the GPU (color) and what it's
         # running (letter).
