@@ -23,16 +23,21 @@ The simulation engine calls:
     scheduler.select_server(job, servers) -> int | None
 
 `job` is the pending Workload.Job (so `job.tenant_id`, `job.wtype`
-(light/medium/heavy), `job.size`, `job.iters` are all available to inform
-placement). `servers` is a list of dicts, one per server slot, ordered by
+(light/medium/heavy), `job.size`, `job.iters`, `job.mem_mb`, `job.priority`
+are all available to inform placement). `servers` is a list of dicts, one per
+server slot (each the execution arm of a simulated MIG partition), ordered by
 index:
 
-    {"index": int, "free": bool, "tenant": str | None, "queue_len": int}
+    {"index": int, "free": bool, "tenant": str | None, "queue_len": int,
+     "cap_mb": int, "used_mb": int, "headroom_mb": int}
 
-    index     -- the server's slot number (also its position in the list)
-    free      -- True if the server is idle (nothing assigned to it right now)
-    tenant    -- tenant_id of the job currently executing on the server, else None
-    queue_len -- how many jobs are assigned to that server (waiting + running)
+    index       -- the server's slot number (also its position in the list)
+    free        -- True if the server is idle (nothing assigned to it right now)
+    tenant      -- tenant_id of the job currently executing on the server, else None
+    queue_len   -- how many jobs are assigned to that server (waiting + running)
+    cap_mb      -- the partition's VRAM cap (logical, policy-enforced)
+    used_mb     -- declared mem_mb reserved by jobs placed-and-not-finished
+    headroom_mb -- cap_mb - used_mb (can go negative if placed past the cap)
 
 Return the index of the server the job should run on. Servers have unbounded
 inboxes, so you may return a *busy* server's index -- the job then waits in

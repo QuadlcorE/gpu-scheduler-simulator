@@ -1,11 +1,14 @@
 """
 Simulation layer -- real execution engine.
 
-The engine models `capacity` GPUs as `capacity` servers, each a worker thread
-bound to a torch device. Tenants generate random matmul workloads; the
-scheduler (Scheduling_control) decides which server each job runs on; the
-server thread actually executes the workload on PyTorch and reports measured
-metrics.
+The engine models `capacity` simulated MIG partitions (simulation.partition),
+each served by a worker thread bound to a torch device -- on the single-GPU
+setup all of them execute on the same physical cuda:0, and the partition
+supplies the policy state: a VRAM reservation ledger (declared mem_mb of jobs
+placed-and-not-finished) and a cooperative throttle flag that soft-enforces
+its compute share. Tenants generate random matmul workloads; the scheduler
+(Scheduling_control) decides which partition each job runs on; the server
+thread actually executes the workload on PyTorch and reports measured metrics.
 
 There is no virtual clock here -- unlike a discrete-event model, real PyTorch
 work takes real wall-clock time, so "sim_time" is simply seconds elapsed since
@@ -40,6 +43,7 @@ import torch
 
 from Scheduling_control.scheduler import Scheduler
 from Workload.workload import DEFAULT_TENANTS, build_experiment
+from simulation.partition import apply_compute_shares, build_partitions
 from simulation.results import summarize
 
 
@@ -78,10 +82,14 @@ def _device_for(index: int) -> "torch.device":
 # ---------------------------------------------------------------------------
 
 class Server(threading.Thread):
-    def __init__(self, index, device, stop_flag, on_start, on_done):
+    def __init__(self, index, device, partition, stop_flag, on_start, on_done):
         super().__init__(daemon=True)
         self.index = index
         self.device = device
+        # The logical partition this server executes for. On the single-GPU
+        # setup every server's `device` is the same physical cuda:0; the
+        # partition supplies the policy state (VRAM ledger, throttle flag).
+        self.partition = partition
         self.stop_flag = stop_flag
         self.on_start = on_start
         self.on_done = on_done
@@ -97,7 +105,9 @@ class Server(threading.Thread):
             except queue.Empty:
                 continue
             self.on_start(self.index, job)  # server-queue wait ends here
-            metrics = job.run(self.device)
+            # The partition's throttle flag enforces its compute share (and,
+            # later, admission-controller throttling) cooperatively.
+            metrics = job.run(self.device, throttle=self.partition.throttle)
             self.on_done(self.index, job, metrics)
 
 
@@ -107,8 +117,16 @@ class Server(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class MultiTenantSimulation:
-    def __init__(self, event_q, stop_flag, capacity, tenants, jobs, scheduler=None):
+    def __init__(self, event_q, stop_flag, capacity, tenants, jobs, scheduler=None,
+                 partitions=None):
         self.event_q, self.stop_flag = event_q, stop_flag
+        # Each server slot is the execution arm of one simulated MIG partition
+        # (simulation.partition). Default: `capacity` equal slices of the
+        # physical VRAM with equal compute shares. Under-fair-share partitions
+        # get their throttle flag raised here, once, for the whole run.
+        self.partitions = partitions if partitions is not None else build_partitions(capacity)
+        apply_compute_shares(self.partitions)
+        capacity = len(self.partitions)
         self.capacity = capacity
         self.tenants = list(tenants)
         # The pre-generated job trace: a finite, ordered list of jobs, each with
@@ -146,7 +164,8 @@ class MultiTenantSimulation:
         }
 
         self.servers = [
-            Server(i, _device_for(i), stop_flag, self._on_job_start, self._on_job_done)
+            Server(i, _device_for(i), self.partitions[i], stop_flag,
+                   self._on_job_start, self._on_job_done)
             for i in range(capacity)
         ]
         self.device_desc = str(self.servers[0].device) if self.servers else "cpu"
@@ -191,12 +210,17 @@ class MultiTenantSimulation:
             # A server is "free" when nothing is assigned to it (load 0);
             # queue_len is its real load -- jobs waiting in its inbox plus the
             # one running. The scheduler may pick a busy server to queue behind.
+            # The partition fields expose each slice's memory state (from its
+            # reservation ledger) so placement can be memory-aware.
             view = [
                 {
                     "index": i,
                     "free": self.server_load[i] == 0,
                     "tenant": self.owner.get(i),
                     "queue_len": self.server_load[i],
+                    "cap_mb": self.partitions[i].vram_cap_mb,
+                    "used_mb": self.partitions[i].used_mb,
+                    "headroom_mb": self.partitions[i].headroom_mb,
                 }
                 for i in range(self.capacity)
             ]
@@ -206,7 +230,10 @@ class MultiTenantSimulation:
                 idx = self.scheduler.select_server(job, view)
                 if idx is not None and 0 <= idx < self.capacity:
                     # Place the job on server idx; it queues there if busy.
+                    # Its declared demand is reserved on the partition's ledger
+                    # from placement until completion.
                     self.server_load[idx] += 1
+                    self.partitions[idx].reserve(job)
                     rec = self.active_jobs.get(job.job_id)
                     if rec is not None:
                         rec["state"] = "server-queue"
@@ -215,6 +242,8 @@ class MultiTenantSimulation:
                     # Reflect the new load so later jobs in this pass see it.
                     view[idx]["free"] = False
                     view[idx]["queue_len"] = self.server_load[idx]
+                    view[idx]["used_mb"] = self.partitions[idx].used_mb
+                    view[idx]["headroom_mb"] = self.partitions[idx].headroom_mb
                     self.servers[idx].submit(job)
                     assigned = True
                 else:
@@ -236,6 +265,7 @@ class MultiTenantSimulation:
 
     # ---- a server finished a job (called from the server thread) ----
     def _on_job_done(self, index, job, metrics):
+        self.partitions[index].release(job)  # frees its VRAM reservation
         with self._lock:
             self.server_load[index] -= 1
             if self.running_job.get(index) == job.job_id:
@@ -352,6 +382,8 @@ class MultiTenantSimulation:
                 "capacity": self.capacity,
                 "gpu_owner": dict(self.owner),
                 "server_queue": list(self.server_load),
+                # Per-partition memory/throttle state (ledger-based used/cap).
+                "partitions": [p.snapshot() for p in self.partitions],
                 "tenant_stats": tenant_stats,
                 "device": self.device_desc,
                 "jobs": jobs,
@@ -393,7 +425,7 @@ class MultiTenantSimulation:
 
 
 def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None,
-                           scheduler=None):
+                           scheduler=None, partitions=None):
     if tenants is None or jobs is None:
         # Standalone/default run: build a small reproducible experiment so the
         # engine stays runnable without the UI supplying a config.
@@ -402,5 +434,6 @@ def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None
             counts={"light": 3, "medium": 2, "heavy": 1},
             seed=0,
         )
-    sim = MultiTenantSimulation(event_q, stop_flag, capacity, tenants, jobs, scheduler)
+    sim = MultiTenantSimulation(event_q, stop_flag, capacity, tenants, jobs, scheduler,
+                                partitions=partitions)
     sim.run()
