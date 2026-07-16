@@ -10,7 +10,9 @@ class PinnedScheduler(Scheduler):
     """Each tenant is assigned to a fixed server; its jobs only run there.
 
     Tenants are mapped to servers round-robin on first sight, so with more
-    tenants than servers several tenants share a server and time-slice it."""
+    tenants than servers several tenants share a server. A tenant's jobs always
+    queue at its own server (waiting in that server's queue when it is busy)
+    rather than sitting in the global queue."""
 
     NAME = "Pinned (tenant to GPU)"
 
@@ -23,5 +25,5 @@ class PinnedScheduler(Scheduler):
         return self._tenant_server[tenant_id]
 
     def select_server(self, job, servers):
-        idx = self._server_for(job.tenant_id, len(servers))
-        return idx if servers[idx]["free"] else None
+        # Always return the pinned server: the job queues there if it is busy.
+        return self._server_for(job.tenant_id, len(servers))

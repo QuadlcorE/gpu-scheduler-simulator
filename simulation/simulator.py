@@ -12,7 +12,22 @@ work takes real wall-clock time, so "sim_time" is simply seconds elapsed since
 the run started. State snapshots pushed onto event_q keep the same schema the
 GUI already consumes:
 
-    {"sim_time", "capacity", "gpu_owner", "tenant_stats", "device"}
+    {"sim_time", "capacity", "gpu_owner", "tenant_stats", "device", ...}
+
+Queues and lifecycle timing
+---------------------------
+Each server owns an *unbounded* inbox, so the scheduler may place a job on a
+busy server, where it waits in that server's queue behind the running job.
+Every job passes through the same lifecycle, each stage timestamped so the two
+kinds of waiting can be measured separately:
+
+    submit_time -- released into the global queue (job arrives)
+    assign_time -- scheduler places it on a server (leaves the global queue)
+    start_time  -- that server begins executing it
+    end_time    -- execution finishes
+
+    global-queue wait = assign_time - submit_time   (waiting for placement)
+    server-queue wait = start_time  - assign_time   (waiting behind other jobs)
 """
 
 import queue
@@ -56,17 +71,20 @@ def _device_for(index: int) -> "torch.device":
 
 
 # ---------------------------------------------------------------------------
-# Server -- one GPU slot. A worker thread that runs whatever job it is handed.
+# Server -- one GPU slot. A worker thread that runs whatever jobs it is handed.
+# Its inbox is an unbounded queue, so jobs assigned while it is busy wait here
+# (FIFO) until it works its way to them.
 # ---------------------------------------------------------------------------
 
 class Server(threading.Thread):
-    def __init__(self, index, device, stop_flag, on_done):
+    def __init__(self, index, device, stop_flag, on_start, on_done):
         super().__init__(daemon=True)
         self.index = index
         self.device = device
         self.stop_flag = stop_flag
+        self.on_start = on_start
         self.on_done = on_done
-        self.inbox = queue.Queue(maxsize=1)  # holds at most the current job
+        self.inbox = queue.Queue()  # unbounded: assigned jobs wait here in order
 
     def submit(self, job):
         self.inbox.put(job)
@@ -77,13 +95,14 @@ class Server(threading.Thread):
                 job = self.inbox.get(timeout=0.1)
             except queue.Empty:
                 continue
+            self.on_start(self.index, job)  # server-queue wait ends here
             metrics = job.run(self.device)
             self.on_done(self.index, job, metrics)
 
 
 # ---------------------------------------------------------------------------
-# Main simulator -- connects the scheduler, runs each tenant's workloads, and
-# assigns them to servers as they arrive.
+# Main simulator -- connects the scheduler, replays the job trace, and assigns
+# each job to a server (possibly a busy one, where it queues) as it arrives.
 # ---------------------------------------------------------------------------
 
 class MultiTenantSimulation:
@@ -101,18 +120,28 @@ class MultiTenantSimulation:
         self._t0 = time.perf_counter()
         self._lock = threading.Lock()
 
-        self.pending = deque()          # jobs waiting for a server
-        self.free = set(range(capacity))
-        self.owner = {}                 # server index -> tenant currently on it
-        self.active_jobs = {}           # job_id -> live record (queued/running)
+        self.pending = deque()          # jobs in the global queue (not yet placed)
+        # Per-server load: jobs assigned to a server that have not finished
+        # (waiting in its inbox + the one running). 0 means the server is idle.
+        self.server_load = [0] * capacity
+        self.running_job = {}           # server index -> job_id currently executing
+        self.owner = {}                 # server index -> tenant currently executing there
+        self.active_jobs = {}           # job_id -> live record (queued/waiting/running)
         self.completed = 0              # trace jobs finished so far
+        # Persistent per-tenant tallies. Live queued/waiting/running counts are
+        # derived from active_jobs at snapshot time; completed jobs leave the
+        # active set, so their finished wait times are accumulated here.
         self.stats = {
-            t.tenant_id: {"queued": 0, "running": 0, "completed": 0}
+            t.tenant_id: {
+                "completed": 0,
+                "global_wait_total": 0.0,
+                "server_wait_total": 0.0,
+            }
             for t in self.tenants
         }
 
         self.servers = [
-            Server(i, _device_for(i), stop_flag, self._on_job_done)
+            Server(i, _device_for(i), stop_flag, self._on_job_start, self._on_job_done)
             for i in range(capacity)
         ]
         self.device_desc = str(self.servers[0].device) if self.servers else "cpu"
@@ -126,14 +155,17 @@ class MultiTenantSimulation:
             if self._sleep_until(job.arrival_time):
                 return  # stopped before this job's arrival
             with self._lock:
-                self.stats[job.tenant_id]["queued"] += 1
                 self.pending.append(job)
                 self.active_jobs[job.job_id] = {
                     "job_id": job.job_id, "tenant": job.tenant_id,
                     "size": job.size, "iters": job.iters, "wtype": job.wtype,
                     "state": "queued", "gpu": None,
+                    "submit_time": self._now(),  # enters the global queue now
+                    "assign_time": None,         # set when the scheduler places it
+                    "start_time": None,          # set when a server begins it
                 }
             self._snapshot()
+            self._dispatch()  # place it now, so global-queue wait isn't just poll latency
 
     def _sleep_until(self, target):
         """Sleep until `target` seconds after run start, in small chunks so a
@@ -149,17 +181,17 @@ class MultiTenantSimulation:
     def _dispatch(self):
         assigned = False
         with self._lock:
-            if not self.pending or not self.free:
+            if not self.pending:
                 return
-            # queue_len is 0 for an idle server and 1 for a busy one today
-            # (each server runs a single job at a time); it becomes a real
-            # per-server queue depth once server-side queuing lands.
+            # A server is "free" when nothing is assigned to it (load 0);
+            # queue_len is its real load -- jobs waiting in its inbox plus the
+            # one running. The scheduler may pick a busy server to queue behind.
             view = [
                 {
                     "index": i,
-                    "free": i in self.free,
+                    "free": self.server_load[i] == 0,
                     "tenant": self.owner.get(i),
-                    "queue_len": 0 if i in self.free else 1,
+                    "queue_len": self.server_load[i],
                 }
                 for i in range(self.capacity)
             ]
@@ -167,36 +199,57 @@ class MultiTenantSimulation:
             while self.pending:
                 job = self.pending.popleft()
                 idx = self.scheduler.select_server(job, view)
-                if idx is not None and idx in self.free:
-                    self.free.discard(idx)
-                    self.owner[idx] = job.tenant_id
-                    self.stats[job.tenant_id]["queued"] -= 1
-                    self.stats[job.tenant_id]["running"] += 1
-                    view[idx]["free"] = False
-                    view[idx]["tenant"] = job.tenant_id
-                    view[idx]["queue_len"] = 1
+                if idx is not None and 0 <= idx < self.capacity:
+                    # Place the job on server idx; it queues there if busy.
+                    self.server_load[idx] += 1
                     rec = self.active_jobs.get(job.job_id)
                     if rec is not None:
-                        rec["state"] = "running"
+                        rec["state"] = "server-queue"
                         rec["gpu"] = idx
+                        rec["assign_time"] = self._now()  # leaves the global queue
+                    # Reflect the new load so later jobs in this pass see it.
+                    view[idx]["free"] = False
+                    view[idx]["queue_len"] = self.server_load[idx]
                     self.servers[idx].submit(job)
                     assigned = True
                 else:
-                    still_pending.append(job)
+                    still_pending.append(job)  # scheduler holds it in the global queue
             self.pending = still_pending
         if assigned:
             self._snapshot()
 
+    # ---- a server began executing a job (called from the server thread) ----
+    def _on_job_start(self, index, job):
+        with self._lock:
+            rec = self.active_jobs.get(job.job_id)
+            if rec is not None:
+                rec["state"] = "running"
+                rec["start_time"] = self._now()  # server-queue wait ends here
+            self.owner[index] = job.tenant_id
+            self.running_job[index] = job.job_id
+        self._snapshot()
+
     # ---- a server finished a job (called from the server thread) ----
     def _on_job_done(self, index, job, metrics):
         with self._lock:
-            self.free.add(index)
-            self.owner.pop(index, None)
-            self.active_jobs.pop(job.job_id, None)
-            self.stats[job.tenant_id]["running"] -= 1
-            self.stats[job.tenant_id]["completed"] += 1
+            self.server_load[index] -= 1
+            if self.running_job.get(index) == job.job_id:
+                self.running_job.pop(index, None)
+                self.owner.pop(index, None)
+            rec = self.active_jobs.pop(job.job_id, None)
+            st = self.stats[job.tenant_id]
+            st["completed"] += 1
+            if rec is not None:
+                submit = rec["submit_time"]
+                assign = rec["assign_time"] if rec["assign_time"] is not None else submit
+                start = rec["start_time"] if rec["start_time"] is not None else assign
+                st["global_wait_total"] += assign - submit
+                st["server_wait_total"] += start - assign
             self.completed += 1
         self._snapshot()
+        # A slot just freed: offer any globally-queued jobs (schedulers that
+        # decline busy servers) a server now rather than on the next heartbeat.
+        self._dispatch()
 
     def _is_complete(self):
         """The run is done once every trace job has finished. total_jobs is
@@ -209,13 +262,56 @@ class MultiTenantSimulation:
         # Build the payload under the lock so the job list stays consistent
         # with owner/stats even while the release and server threads mutate them.
         with self._lock:
+            now = self._now()
+
+            # Per-job live records, with the two wait times computed at `now`:
+            # a job still queued/waiting accrues wait up to the current instant,
+            # while a job that has moved on carries its finalized wait.
+            jobs = []
+            for r in self.active_jobs.values():
+                submit, assign, start = r["submit_time"], r["assign_time"], r["start_time"]
+                if assign is None:
+                    global_wait, server_wait = now - submit, 0.0
+                else:
+                    global_wait = assign - submit
+                    server_wait = (now - assign) if start is None else (start - assign)
+                d = dict(r)
+                d["global_wait"] = global_wait
+                d["server_wait"] = server_wait
+                jobs.append(d)
+
+            # Live per-tenant counts derived from the active records, merged with
+            # the persistent completed/wait tallies (completed jobs are gone from
+            # active_jobs, so their totals live in self.stats).
+            live = {t: {"queued": 0, "waiting": 0, "running": 0} for t in self.stats}
+            for r in self.active_jobs.values():
+                bucket = {"queued": "queued", "server-queue": "waiting",
+                          "running": "running"}.get(r["state"])
+                if bucket:
+                    live[r["tenant"]][bucket] += 1
+
+            tenant_stats = {}
+            for t, s in self.stats.items():
+                done_n = s["completed"]
+                tenant_stats[t] = {
+                    "queued": live[t]["queued"],
+                    "waiting": live[t]["waiting"],
+                    "running": live[t]["running"],
+                    "completed": done_n,
+                    "global_wait_total": s["global_wait_total"],
+                    "server_wait_total": s["server_wait_total"],
+                    "avg_global_wait": s["global_wait_total"] / done_n if done_n else 0.0,
+                    "avg_server_wait": s["server_wait_total"] / done_n if done_n else 0.0,
+                }
+
             payload = {
-                "sim_time": self._now(),
+                "sim_time": now,
                 "capacity": self.capacity,
                 "gpu_owner": dict(self.owner),
-                "tenant_stats": {t: dict(s) for t, s in self.stats.items()},
+                "server_queue": list(self.server_load),
+                "tenant_stats": tenant_stats,
                 "device": self.device_desc,
-                "jobs": [dict(r) for r in self.active_jobs.values()],
+                "jobs": jobs,
                 "completed": self.completed,
                 "total": self.total_jobs,
                 "done": done,
@@ -228,12 +324,15 @@ class MultiTenantSimulation:
         releaser = threading.Thread(target=self._release_trace, daemon=True)
         releaser.start()
 
-        # Run until the trace is exhausted and drained, or the user stops.
+        # Run until the trace is exhausted and drained, or the user stops. A
+        # heartbeat snapshot each pass keeps waiting jobs' live wait times ticking
+        # in the UI even when no job has started or finished this interval.
         while not self.stop_flag.is_set():
             self._dispatch()
             if self._is_complete():
                 break
-            time.sleep(0.02)
+            self._snapshot()
+            time.sleep(0.1)
 
         # graceful shutdown: let in-flight jobs finish, then join workers
         releaser.join(timeout=1.0)

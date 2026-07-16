@@ -135,12 +135,13 @@ class Dashboard(tk.Tk):
         frame = ttk.LabelFrame(self, text="Job Queue  (generated jobs and their assigned GPU)")
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        cols = ("job", "tenant", "type", "size", "iters", "state", "gpu")
+        cols = ("job", "tenant", "type", "size", "iters", "state", "gpu",
+                "gwait", "swait")
         headings = {"job": "Job #", "tenant": "Tenant", "type": "Type",
                     "size": "Matrix", "iters": "Iters", "state": "State",
-                    "gpu": "GPU"}
+                    "gpu": "GPU", "gwait": "Global wait", "swait": "Server wait"}
         widths = {"job": 60, "tenant": 90, "type": 70, "size": 80,
-                  "iters": 60, "state": 90, "gpu": 60}
+                  "iters": 60, "state": 100, "gpu": 60, "gwait": 90, "swait": 90}
 
         self.queue_tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
         for c in cols:
@@ -173,6 +174,7 @@ class Dashboard(tk.Tk):
         for child in self.tenant_frame.winfo_children():
             child.destroy()
         self.tenant_vars = {}
+        self.tenant_wait_vars = {}
         for tenant in self.tenants:
             row = ttk.Frame(self.tenant_frame)
             row.pack(fill="x", padx=5, pady=2)
@@ -180,9 +182,13 @@ class Dashboard(tk.Tk):
             swatch.create_rectangle(0, 0, 14, 14, fill=tenant.color, outline="")
             swatch.pack(side="left", padx=(0, 5))
             ttk.Label(row, text=tenant.tenant_id, width=10).pack(side="left")
-            var = tk.StringVar(value="queued: 0   running: 0   completed: 0")
+            var = tk.StringVar(value="queued: 0   waiting: 0   running: 0   completed: 0")
             ttk.Label(row, textvariable=var).pack(side="left")
+            # Average per-job wait, split by queue type, over completed jobs.
+            wvar = tk.StringVar(value="avg wait — global: 0.00s   server: 0.00s")
+            ttk.Label(row, textvariable=wvar, foreground="#555555").pack(side="left", padx=(15, 0))
             self.tenant_vars[tenant.tenant_id] = var
+            self.tenant_wait_vars[tenant.tenant_id] = wvar
 
     def _build_hw_panel(self):
         frame = ttk.LabelFrame(self, text="Hardware")
@@ -338,11 +344,17 @@ class Dashboard(tk.Tk):
             if j.get("gpu") is not None and j.get("state") == "running":
                 wt = WORKLOAD_TYPES.get(j.get("wtype"))
                 gpu_types[j["gpu"]] = wt.label if wt else "?"
-        self._draw_grid(snap["capacity"], snap["gpu_owner"], gpu_types)
+        self._draw_grid(snap["capacity"], snap["gpu_owner"], gpu_types,
+                        snap.get("server_queue"))
         for tenant_id, s in snap["tenant_stats"].items():
             if tenant_id in self.tenant_vars:
                 self.tenant_vars[tenant_id].set(
-                    f"queued: {s['queued']}   running: {s['running']}   completed: {s['completed']}"
+                    f"queued: {s['queued']}   waiting: {s['waiting']}   "
+                    f"running: {s['running']}   completed: {s['completed']}"
+                )
+                self.tenant_wait_vars[tenant_id].set(
+                    f"avg wait — global: {s['avg_global_wait']:.2f}s   "
+                    f"server: {s['avg_server_wait']:.2f}s"
                 )
         self._render_queue(snap.get("jobs", []))
 
@@ -357,12 +369,15 @@ class Dashboard(tk.Tk):
                 "", "end",
                 values=(j["job_id"], j["tenant"], (j.get("wtype") or "—").capitalize(),
                         f"{j['size']}²", j["iters"], j["state"],
-                        "—" if gpu is None else gpu),
+                        "—" if gpu is None else gpu,
+                        f"{j.get('global_wait', 0.0):.2f}s",
+                        f"{j.get('server_wait', 0.0):.2f}s"),
                 tags=(j["tenant"],),
             )
 
-    def _draw_grid(self, capacity, gpu_owner, gpu_types=None):
+    def _draw_grid(self, capacity, gpu_owner, gpu_types=None, server_queue=None):
         gpu_types = gpu_types or {}
+        server_queue = server_queue or []
         self.grid_canvas.delete("all")
         pad = 6
         for gpu_id in range(capacity):
@@ -383,6 +398,13 @@ class Dashboard(tk.Tk):
                 self.grid_canvas.create_text((x0 + x1) / 2, y0 + self.BOX * 0.68,
                                              text=letter, fill=fg,
                                              font=("TkDefaultFont", 12, "bold"))
+            # Jobs waiting in this server's queue behind the running one, shown
+            # as a "+N" badge in the corner so per-server backlog is visible.
+            load = server_queue[gpu_id] if gpu_id < len(server_queue) else 0
+            waiting = load - 1 if load > 0 else 0
+            if waiting > 0:
+                self.grid_canvas.create_text(x1 - 8, y0 + 8, text=f"+{waiting}",
+                                             fill=fg, font=("TkDefaultFont", 8, "bold"))
         rows_needed = (capacity + self.GRID_COLS - 1) // self.GRID_COLS
         self.grid_canvas.configure(height=max(80, rows_needed * (self.BOX + pad) + pad))
 

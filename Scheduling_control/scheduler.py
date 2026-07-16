@@ -30,12 +30,15 @@ index:
     {"index": int, "free": bool, "tenant": str | None, "queue_len": int}
 
     index     -- the server's slot number (also its position in the list)
-    free      -- True if the server can take a job right now
-    tenant    -- tenant_id of the job currently occupying the server, else None
-    queue_len -- how many jobs are waiting on/running at that server
+    free      -- True if the server is idle (nothing assigned to it right now)
+    tenant    -- tenant_id of the job currently executing on the server, else None
+    queue_len -- how many jobs are assigned to that server (waiting + running)
 
-Return the index of the server the job should run on, or None to leave the
-job queued (e.g. the server this tenant is pinned to is currently busy).
+Return the index of the server the job should run on. Servers have unbounded
+inboxes, so you may return a *busy* server's index -- the job then waits in
+that server's queue (its server-queue wait) behind whatever is ahead of it.
+Return None to leave the job in the global queue instead (e.g. to hold it
+until some server frees up); it is offered again on the next dispatch pass.
 """
 
 
