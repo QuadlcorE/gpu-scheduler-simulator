@@ -73,6 +73,7 @@ import simpy
 import simpy.rt
 import torch
 
+from GPUMonitoring.monitoring import TelemetrySampler
 from Scheduling_control.admission import ADMIT, REJECT, AdmissionController
 from Scheduling_control.scheduler import Scheduler
 from Workload.workload import DEFAULT_TENANTS, build_experiment
@@ -193,6 +194,13 @@ class MultiTenantSimulation:
         # against this run's partition set with log timestamps on sim_time.
         self.admission = admission if admission is not None else AdmissionController(
             partitions=self.partitions, clock=self._now)
+
+        # Run-scoped telemetry sampler (§3.3.2): for the duration of the run
+        # it samples measured GPU util + VRAM (NVML) alongside each partition's
+        # ledger usage, on the run's own clock. Its log is what makes the
+        # measured-utilization and partition-stability metrics computable.
+        self.telemetry = TelemetrySampler(partitions=self.partitions,
+                                          clock=self._now)
 
         self.pending = deque()          # jobs in the global queue (not yet placed)
         # Per-server load: jobs assigned to a server that have not finished
@@ -579,6 +587,9 @@ class MultiTenantSimulation:
                 # admission-log CSV without reaching into the simulator thread.
                 payload["admission_log"] = list(self.admission.log)
                 payload["throttle_log"] = list(self.admission.throttle_log)
+                # The run's measured telemetry timeline (GPU util / VRAM /
+                # per-partition ledger samples), same rationale as above.
+                payload["telemetry"] = self.telemetry.samples
         self.event_q.put(payload)
 
     def run(self):
@@ -606,6 +617,10 @@ class MultiTenantSimulation:
         # Anchor both clocks to the same instant: sim_time 0 (_now's epoch)
         # == env.now 0 (sync() resets the environment's real-time epoch).
         self._t0 = time.perf_counter()
+        # Telemetry runs for exactly the run's duration, timestamped on the
+        # same clock as sim_time (started after the epoch reset above, so its
+        # first sample lands at t ~= 0).
+        self.telemetry.start()
         env.sync()
         # The dispatch process is the run's driver: it returns when the whole
         # trace has finished, or when the user stops. Arrival events still
@@ -618,6 +633,7 @@ class MultiTenantSimulation:
         self.stop_flag.set()
         for s in self.servers:
             s.join(timeout=2.0)
+        self.telemetry.stop()
 
         # Final snapshot flags completion so the GUI can re-enable its controls.
         self._snapshot(done=True)
