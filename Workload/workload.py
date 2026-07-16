@@ -20,25 +20,43 @@ import torch
 # ---------------------------------------------------------------------------
 # Workload types -- three fixed presets so a run has a mix of job "sizes".
 #
-# Each type pins the matrix dimension (compute grows ~N^3) and the range the
-# iteration count is drawn from. The sizes are chosen so "heavy" visibly takes
-# seconds while "light" is near-instant; recalibrate per machine if needed.
+# Each type pins the matrix dimension (compute grows ~N^3), a batch dimension
+# (the GEMM runs on (batch, N, N) tensors), the range the iteration count is
+# drawn from, and the range its declared VRAM demand is drawn from. The
+# compute sizes are chosen so "heavy" visibly takes seconds while "light" is
+# near-instant; the memory ranges are sized for a 4 GB single-GPU setup so a
+# handful of heavy jobs can genuinely exhaust a partition. Recalibrate per
+# machine if needed.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class WorkloadType:
-    name: str          # "light" / "medium" / "heavy"
-    label: str         # single-letter tag for compact UI ("L" / "M" / "H")
-    size: int          # NxN matrix dimension for the GEMM
-    iter_range: tuple  # (min, max) matmul iterations, inclusive
+    name: str            # "light" / "medium" / "heavy"
+    label: str           # single-letter tag for compact UI ("L" / "M" / "H")
+    size: int            # NxN matrix dimension for the GEMM
+    batch: int           # batch dimension: the GEMM runs on (batch, N, N)
+    iter_range: tuple    # (min, max) matmul iterations, inclusive
+    mem_range_mb: tuple  # (min, max) declared VRAM demand in MB, inclusive
 
 
-LIGHT = WorkloadType("light", "L", 128, (10, 30))
-MEDIUM = WorkloadType("medium", "M", 384, (10, 30))
-HEAVY = WorkloadType("heavy", "H", 768, (5, 15))
+LIGHT = WorkloadType("light", "L", 128, 1, (10, 30), (100, 250))
+MEDIUM = WorkloadType("medium", "M", 384, 2, (10, 30), (400, 700))
+HEAVY = WorkloadType("heavy", "H", 768, 4, (5, 15), (900, 1400))
 
 # Lookup by name; also the canonical light->medium->heavy ordering.
 WORKLOAD_TYPES = {w.name: w for w in (LIGHT, MEDIUM, HEAVY)}
+
+# Priority is drawn per job from this inclusive range (uniform, from the seeded
+# trace RNG). Higher value = more urgent; the priority scheduler serves higher
+# values first. The range is deliberately small so ties are common and the
+# arrival-order tiebreak stays visible in results.
+PRIORITY_RANGE = (0, 9)
+
+# How long one throttled iteration sleeps before doing its matmul. This is the
+# cooperative compute-share/throttle knob: a throttled job still finishes, it
+# just yields the GPU between kernels (queue-order-level control only -- there
+# is no kernel-level preemption).
+THROTTLE_SLEEP_S = 0.05
 
 
 @dataclass
@@ -48,32 +66,81 @@ class Job:
     size: int                  # NxN matrix dimension for the GEMM
     iters: int                 # number of matmul iterations
     wtype: str = "medium"      # workload type name (key into WORKLOAD_TYPES)
+    batch: int = 1             # GEMM batch dimension (from the workload type)
+    mem_mb: int = 0            # declared VRAM demand in MB (drawn from the trace RNG)
+    priority: int = 0          # drawn from PRIORITY_RANGE; higher = more urgent
     arrival_time: float = 0.0  # planned arrival, seconds from run start (from the trace)
     metrics: dict = field(default_factory=dict)  # filled in by run()
 
-    def run(self, device):
+    def run(self, device, throttle=None):
         """Execute the GEMM workload on `device` and return measured metrics.
 
-        Runs a chained matrix multiply so PyTorch cannot optimize the loop
-        away, then forces evaluation so the wall-clock time reflects real
-        compute (important once this runs on CUDA, where ops are async)."""
-        a = torch.randn(self.size, self.size, device=device)
-        b = torch.randn(self.size, self.size, device=device)
+        Runs a chained batched matrix multiply so PyTorch cannot optimize the
+        loop away, then forces evaluation so the wall-clock time reflects real
+        compute (important once this runs on CUDA, where ops are async).
 
+        The job first allocates a *ballast* tensor of its declared `mem_mb` on
+        the device, so its real memory footprint matches the demand the
+        admission controller reasoned about -- NVML genuinely sees it, and a
+        bad admission decision can genuinely OOM. A CUDA OOM is caught and
+        recorded in the metrics (``oom: True``) instead of crashing the server
+        thread.
+
+        `throttle` is an optional shared flag (anything with ``is_set()``,
+        e.g. ``threading.Event``). It is checked before every iteration; while
+        set, the job sleeps THROTTLE_SLEEP_S between kernels, cooperatively
+        yielding the GPU. The metrics record whether (and how long) the job
+        was throttled."""
+        ballast = a = b = None
+        throttled_iters = 0
+        throttle_s = 0.0
         t0 = time.perf_counter()
-        for _ in range(self.iters):
-            a = torch.matmul(a, b)
-            a = a / (a.norm() + 1e-6)  # keep values bounded across iterations
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        try:
+            # Declared footprint: mem_mb of float32 on the device (1 MB = 2^20
+            # bytes / 4 bytes per element), held for the job's whole lifetime.
+            if self.mem_mb > 0:
+                ballast = torch.empty(
+                    int(self.mem_mb) * (1024 * 1024 // 4),
+                    dtype=torch.float32, device=device,
+                )
+            a = torch.randn(self.batch, self.size, self.size, device=device)
+            b = torch.randn(self.batch, self.size, self.size, device=device)
+
+            for _ in range(self.iters):
+                if throttle is not None and throttle.is_set():
+                    throttled_iters += 1
+                    ts = time.perf_counter()
+                    time.sleep(THROTTLE_SLEEP_S)
+                    throttle_s += time.perf_counter() - ts
+                a = torch.matmul(a, b)
+                a = a / (a.norm() + 1e-6)  # keep values bounded across iterations
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            oom = False
+        except torch.cuda.OutOfMemoryError:
+            # The declared demand didn't fit -- the exact failure a bad
+            # admission policy causes. Record it as a job outcome (feeds the
+            # OOM-occurrence-rate metric) rather than killing the server.
+            oom = True
         wall_s = time.perf_counter() - t0
 
-        # A cheap flop estimate: each NxN @ NxN matmul is ~2*N^3 flops.
-        flops = 2 * (self.size ** 3) * self.iters
+        if oom:
+            # Release whatever partially allocated so the device recovers.
+            ballast = a = b = None
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        # A cheap flop estimate: each batched NxN @ NxN matmul is ~2*batch*N^3.
+        flops = 2 * self.batch * (self.size ** 3) * self.iters
         self.metrics = {
             "wall_s": wall_s,
-            "gflops": flops / wall_s / 1e9 if wall_s > 0 else 0.0,
+            "gflops": (flops / wall_s / 1e9) if (wall_s > 0 and not oom) else 0.0,
             "device": str(device),
+            "mem_mb": self.mem_mb,
+            "oom": oom,
+            "throttled": throttled_iters > 0,
+            "throttled_iters": throttled_iters,
+            "throttle_s": throttle_s,
         }
         return self.metrics
 
@@ -88,9 +155,11 @@ class Tenant:
         """Create one matmul workload for this tenant.
 
         `wtype` selects the workload type (a WorkloadType or its name); the
-        type fixes the matrix size and the range the iteration count is drawn
-        from. `rng` is a dedicated ``random.Random`` instance so that a run is
-        reproducible from its seed -- the global RNG is never used here."""
+        type fixes the matrix size / batch and the ranges the iteration count
+        and declared VRAM demand are drawn from. The job's priority is drawn
+        uniformly from PRIORITY_RANGE. `rng` is a dedicated ``random.Random``
+        instance so that a run is reproducible from its seed -- the global RNG
+        is never used here."""
         if isinstance(wtype, str):
             wtype = WORKLOAD_TYPES[wtype]
         return Job(
@@ -99,6 +168,9 @@ class Tenant:
             size=wtype.size,
             iters=rng.randint(*wtype.iter_range),
             wtype=wtype.name,
+            batch=wtype.batch,
+            mem_mb=rng.randint(*wtype.mem_range_mb),
+            priority=rng.randint(*PRIORITY_RANGE),
             arrival_time=arrival_time,
         )
 
@@ -142,19 +214,24 @@ def make_tenants(num_tenants, arrival_rate=DEFAULT_ARRIVAL_RATE):
     ]
 
 
-def generate_trace(tenants, counts, seed):
+def generate_trace(tenants, counts, seed, arrival_rate=None):
     """Return the full, sorted list of jobs for one run.
 
     `counts` is ``{"light": n, "medium": n, "heavy": n}`` -- the number of jobs
-    of each workload type *each* tenant contributes. Every random choice (job
-    ordering, iteration counts, arrival gaps) comes from a single
+    of each workload type *each* tenant contributes. `arrival_rate` (mean jobs
+    per second per tenant) is an experiment parameter: when given it overrides
+    every tenant's own rate, so arrival intensity is controlled per run rather
+    than baked into the tenant objects; when None each tenant's configured rate
+    is used. Every random choice (job ordering, iteration counts, memory
+    demands, priorities, arrival gaps) comes from a single
     ``random.Random(seed)``, so the trace is fully determined by (tenants,
-    counts, seed). Jobs are returned sorted by arrival time with ids assigned
-    in arrival order.
+    counts, seed, arrival_rate). Jobs are returned sorted by arrival time with
+    ids assigned in arrival order.
     """
     rng = random.Random(seed)
     jobs = []
     for tenant in tenants:
+        rate = arrival_rate if arrival_rate is not None else tenant.arrival_rate
         # The multiset of workload types this tenant will submit, shuffled so
         # its light/medium/heavy jobs are interleaved rather than blocked.
         types = []
@@ -164,7 +241,7 @@ def generate_trace(tenants, counts, seed):
 
         t = 0.0
         for wtype in types:
-            t += rng.expovariate(tenant.arrival_rate)
+            t += rng.expovariate(rate)
             # job_id is a placeholder here; reassigned in arrival order below.
             jobs.append(tenant.make_job(0, arrival_time=t, wtype=wtype, rng=rng))
 
@@ -175,9 +252,12 @@ def generate_trace(tenants, counts, seed):
 
 
 def build_experiment(num_tenants, counts, seed, arrival_rate=DEFAULT_ARRIVAL_RATE):
-    """Convenience wrapper: build the tenants and their job trace together."""
+    """Convenience wrapper: build the tenants and their job trace together.
+
+    `arrival_rate` is threaded through both the tenants and the trace, so it
+    is a single, citable config parameter for the whole experiment."""
     tenants = make_tenants(num_tenants, arrival_rate)
-    jobs = generate_trace(tenants, counts, seed)
+    jobs = generate_trace(tenants, counts, seed, arrival_rate=arrival_rate)
     return tenants, jobs
 
 
