@@ -1,10 +1,11 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 import queue
 import threading
 
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
+from simulation.results import write_results_csv
 from Workload.workload import WORKLOAD_TYPES, make_tenants, generate_trace
 from Scheduling_control.loader import load_schedulers
 
@@ -21,6 +22,13 @@ class Dashboard(tk.Tk):
         self.stop_flag = None
         self.worker = None
         self._user_stopped = False
+
+        # Results of the most recent completed run: the raw per-job rows (for
+        # CSV export) and the folded summary (for the results view). Filled from
+        # the engine's final done=True snapshot; a label identifies the run.
+        self.last_results = []
+        self.last_summary = None
+        self._last_run_label = "run"
 
         # Scheduling algorithms the user can pick; each decides how tenants map
         # to GPUs/servers. Discovered from the schedulers/ plugin directory and
@@ -160,6 +168,10 @@ class Dashboard(tk.Tk):
         at a glance. Re-run whenever the tenant set changes."""
         for tenant in self.tenants:
             self.queue_tree.tag_configure(tenant.tenant_id, background=tenant.color)
+        # Completed jobs stay in the table but grayed out, so the full trace
+        # remains visible as the run progresses.
+        self.queue_tree.tag_configure(
+            "completed", background="#f0f0f0", foreground="#a0a0a0")
 
     def _build_tenant_panel(self):
         frame = ttk.LabelFrame(self, text="Tenants")
@@ -272,6 +284,13 @@ class Dashboard(tk.Tk):
         jobs = generate_trace(self.tenants, counts, seed)
 
         self._user_stopped = False
+        # Drop the previous run's results so a run that finishes without any
+        # completed jobs can't re-show stale numbers. Label this run for the
+        # default CSV filename (sanitized: no spaces/parens).
+        self.last_results = []
+        self.last_summary = None
+        safe_name = "".join(c if c.isalnum() else "_" for c in name).strip("_")
+        self._last_run_label = f"{safe_name}_seed{seed}"
         self._set_controls_enabled(False)
         self.status_var.set(
             f"Running {len(jobs)} jobs on {capacity} GPU(s) -- {name} (seed {seed})"
@@ -306,6 +325,76 @@ class Dashboard(tk.Tk):
             self.status_var.set(f"Run complete -- {done} job(s) finished. Adjust the config and click 'Start'")
         else:
             self.status_var.set("Run complete. -- Adjust the config and click 'Start'")
+        # A finite experiment that produced results ends by showing its summary
+        # (per-tenant mean waits, makespan, GPU utilization) with a CSV export.
+        if self.last_summary and self.last_summary.get("jobs"):
+            self._show_results_window()
+
+    # ---- end-of-run results view + CSV export ----
+    def _show_results_window(self):
+        """Pop up the results summary for the just-finished run: headline
+        makespan/utilization, a per-tenant mean-wait table, and CSV export."""
+        s = self.last_summary
+        if not s:
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Run results — {self._last_run_label}")
+        win.geometry("620x420")
+
+        head = ttk.Frame(win)
+        head.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(
+            head,
+            text=(f"Jobs: {s['jobs']}      Makespan: {s['makespan_s']:.2f}s      "
+                  f"GPU utilization: {s['gpu_util'] * 100:.1f}%      "
+                  f"Total compute: {s['total_run_s']:.2f}s"),
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w")
+
+        table = ttk.LabelFrame(win, text="Per-tenant averages")
+        table.pack(fill="both", expand=True, padx=12, pady=6)
+        cols = ("tenant", "jobs", "gwait", "swait")
+        headings = {"tenant": "Tenant", "jobs": "Jobs",
+                    "gwait": "Avg global wait", "swait": "Avg server wait"}
+        widths = {"tenant": 140, "jobs": 70, "gwait": 140, "swait": 140}
+        tree = ttk.Treeview(table, columns=cols, show="headings", height=10)
+        for c in cols:
+            tree.heading(c, text=headings[c])
+            tree.column(c, width=widths[c], anchor="center")
+        for tenant, ts in sorted(s["per_tenant"].items()):
+            tree.tag_configure(tenant, background=self.tenant_colors.get(tenant, "#e0e0e0"))
+            tree.insert("", "end", values=(
+                tenant, ts["jobs"],
+                f"{ts['avg_global_wait']:.2f}s", f"{ts['avg_server_wait']:.2f}s",
+            ), tags=(tenant,))
+        tree.pack(fill="both", expand=True, padx=6, pady=6)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(btns, text="Export to CSV…", command=self._export_csv).pack(side="left")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
+    def _export_csv(self):
+        """Write the last run's per-job rows to a user-chosen CSV file. This is
+        the artifact compared across seeded runs / schedulers."""
+        if not self.last_results:
+            messagebox.showinfo("Nothing to export", "No completed jobs in the last run.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export run results",
+            defaultextension=".csv",
+            initialfile=f"results_{self._last_run_label}.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            n = write_results_csv(path, self.last_results)
+        except OSError as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo("Export complete", f"Wrote {n} job row(s) to\n{path}")
 
     # ---- simulation snapshot polling / rendering ----
     def _poll_sim_queue(self):
@@ -336,6 +425,11 @@ class Dashboard(tk.Tk):
 
     def _render_snapshot(self, snap):
         self.sim_time_var.set(f"t = {snap['sim_time']:.2f}")
+        # The engine's final snapshot carries the results log and summary; stash
+        # them so the run can be exported/summarized once the worker exits.
+        if snap.get("done"):
+            self.last_results = snap.get("results", [])
+            self.last_summary = snap.get("summary")
         # Map each busy GPU to the one-letter tag of the workload running on it,
         # so the grid box shows both who owns the GPU (color) and what it's
         # running (letter).
@@ -360,11 +454,13 @@ class Dashboard(tk.Tk):
 
     def _render_queue(self, jobs):
         """Rebuild the job-queue table from the latest snapshot. Active jobs
-        (queued + running) are shown; completed jobs leave the queue."""
+        (queued + running) keep their tenant shading; completed jobs stay in
+        the table grayed out rather than disappearing."""
         tree = self.queue_tree
         tree.delete(*tree.get_children())
         for j in sorted(jobs, key=lambda r: r["job_id"]):
             gpu = j["gpu"]
+            done = j["state"] == "completed"
             tree.insert(
                 "", "end",
                 values=(j["job_id"], j["tenant"], (j.get("wtype") or "—").capitalize(),
@@ -372,7 +468,7 @@ class Dashboard(tk.Tk):
                         "—" if gpu is None else gpu,
                         f"{j.get('global_wait', 0.0):.2f}s",
                         f"{j.get('server_wait', 0.0):.2f}s"),
-                tags=(j["tenant"],),
+                tags=("completed",) if done else (j["tenant"],),
             )
 
     def _draw_grid(self, capacity, gpu_owner, gpu_types=None, server_queue=None):

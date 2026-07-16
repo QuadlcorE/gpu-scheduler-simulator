@@ -40,6 +40,7 @@ import torch
 
 from Scheduling_control.scheduler import Scheduler
 from Workload.workload import DEFAULT_TENANTS, build_experiment
+from simulation.results import summarize
 
 
 @dataclass
@@ -128,6 +129,10 @@ class MultiTenantSimulation:
         self.owner = {}                 # server index -> tenant currently executing there
         self.active_jobs = {}           # job_id -> live record (queued/waiting/running)
         self.completed = 0              # trace jobs finished so far
+        # Per-run results log: one finalized row per completed job (see
+        # simulation.results). This is the record exported to CSV and folded
+        # into the end-of-run summary -- what makes the run evaluable.
+        self.results = []
         # Persistent per-tenant tallies. Live queued/waiting/running counts are
         # derived from active_jobs at snapshot time; completed jobs leave the
         # active set, so their finished wait times are accumulated here.
@@ -243,13 +248,40 @@ class MultiTenantSimulation:
                 submit = rec["submit_time"]
                 assign = rec["assign_time"] if rec["assign_time"] is not None else submit
                 start = rec["start_time"] if rec["start_time"] is not None else assign
-                st["global_wait_total"] += assign - submit
-                st["server_wait_total"] += start - assign
+                global_wait = assign - submit
+                server_wait = start - assign
+                st["global_wait_total"] += global_wait
+                st["server_wait_total"] += server_wait
+                # Append the finalized per-job row to the results log. arrival_s
+                # is the planned trace arrival (deterministic from the seed);
+                # the wait/run times are the measured outcomes for this run.
+                self.results.append({
+                    "job_id": job.job_id,
+                    "tenant": job.tenant_id,
+                    "wtype": job.wtype,
+                    "size": job.size,
+                    "iters": job.iters,
+                    "arrival_s": job.arrival_time,
+                    "global_wait_s": global_wait,
+                    "server_wait_s": server_wait,
+                    "run_s": metrics.get("wall_s", 0.0),
+                    "gpu": index,
+                    "start_s": start,
+                    "end_s": self._now(),
+                })
             self.completed += 1
         self._snapshot()
         # A slot just freed: offer any globally-queued jobs (schedulers that
         # decline busy servers) a server now rather than on the next heartbeat.
         self._dispatch()
+
+    def build_summary(self):
+        """Return the per-run summary over the results log (see
+        simulation.results.summarize). Safe to call after run() completes."""
+        with self._lock:
+            results = list(self.results)
+            capacity = self.capacity
+        return summarize(results, capacity)
 
     def _is_complete(self):
         """The run is done once every trace job has finished. total_jobs is
@@ -279,6 +311,17 @@ class MultiTenantSimulation:
                 d["global_wait"] = global_wait
                 d["server_wait"] = server_wait
                 jobs.append(d)
+
+            # Completed jobs stay in the table (the UI grays them out) instead
+            # of vanishing: append their finalized rows from the results log.
+            for r in self.results:
+                jobs.append({
+                    "job_id": r["job_id"], "tenant": r["tenant"],
+                    "wtype": r["wtype"], "size": r["size"], "iters": r["iters"],
+                    "state": "completed", "gpu": r["gpu"],
+                    "global_wait": r["global_wait_s"],
+                    "server_wait": r["server_wait_s"],
+                })
 
             # Live per-tenant counts derived from the active records, merged with
             # the persistent completed/wait tallies (completed jobs are gone from
@@ -316,6 +359,12 @@ class MultiTenantSimulation:
                 "total": self.total_jobs,
                 "done": done,
             }
+            # The final snapshot carries the whole results log and the folded
+            # summary, so the UI can export the CSV and show the results view
+            # without reaching back into the simulator thread.
+            if done:
+                payload["results"] = list(self.results)
+                payload["summary"] = summarize(list(self.results), self.capacity)
         self.event_q.put(payload)
 
     def run(self):
