@@ -1,5 +1,28 @@
 """
-Simulation layer -- real execution engine.
+Simulation layer -- SimPy hybrid engine (report §3.1-§3.2).
+
+The engine is a hybrid of discrete-event simulation and real execution:
+arrivals, queueing, dispatch, and admission decisions are modelled as SimPy
+processes/events on a ``simpy.rt.RealtimeEnvironment`` (the event clock is
+synchronized to the wall clock, factor = 1), while job execution happens on
+real server threads running PyTorch. The two halves have to share one clock
+because real GPU work takes real wall-clock time -- a purely virtual clock
+would race ahead of the executions it is supposed to be timing.
+
+Three actors drive a run:
+
+    * the **arrival process** (SimPy) yields ``env.timeout()`` for each gap in
+      the pre-generated trace and releases the next job into the global queue;
+    * the **dispatch process** (SimPy) wakes on arrival/completion events and
+      runs the scheduler -> admission -> placement pipeline;
+    * the **server threads** (real) execute placed jobs on PyTorch and signal
+      completion back to the dispatch process.
+
+SimPy's event calendar is not thread-safe, so the server threads never touch
+``env`` directly: a completion drops a token onto a thread-safe queue, and the
+dispatch process -- which waits on its wake event with a short poll timeout --
+drains that queue and re-enters dispatch. Arrivals happen inside the SimPy
+thread, so they wake the dispatcher directly by succeeding its wake event.
 
 The engine models `capacity` simulated MIG partitions (simulation.partition),
 each served by a worker thread bound to a torch device -- on the single-GPU
@@ -16,10 +39,11 @@ A proposal the controller holds (QUEUE / THROTTLE_RUNNING) stays in the
 global queue for a later pass; a REJECTed job -- one whose declared demand
 could never fit any partition -- is removed and recorded as rejected.
 
-There is no virtual clock here -- unlike a discrete-event model, real PyTorch
-work takes real wall-clock time, so "sim_time" is simply seconds elapsed since
-the run started. State snapshots pushed onto event_q keep the same schema the
-GUI already consumes:
+"sim_time" is seconds elapsed since the run started, which the realtime
+environment keeps equal (to within scheduling jitter) to the SimPy ``env.now``.
+Lifecycle timestamps are still *measured* with a monotonic clock -- they are
+real observations of real executions, not simulated quantities. State
+snapshots pushed onto event_q keep the same schema the GUI already consumes:
 
     {"sim_time", "capacity", "gpu_owner", "tenant_stats", "device", ...}
 
@@ -45,6 +69,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+import simpy
+import simpy.rt
 import torch
 
 from Scheduling_control.admission import ADMIT, REJECT, AdmissionController
@@ -59,6 +85,13 @@ class SimEvent:
     sim_time: float
     kind: str  # "job_start" | "job_end"
     payload: dict = field(default_factory=dict)
+
+
+# How long the dispatch process sleeps between wake checks. This bounds two
+# latencies: how quickly a completion signalled from a server thread reaches
+# the dispatcher, and how quickly a user stop is honoured. It is also the
+# heartbeat-snapshot cadence that keeps live wait times ticking in the UI.
+DISPATCH_POLL_S = 0.05
 
 
 class _DefaultScheduler(Scheduler):
@@ -146,6 +179,14 @@ class MultiTenantSimulation:
         self._t0 = time.perf_counter()
         self._lock = threading.Lock()
 
+        # Bridge from the real server threads into the SimPy world: SimPy's
+        # event calendar is not thread-safe, so a completing server thread
+        # never touches env -- it puts a token here, and the dispatch process
+        # drains the queue on its next wake. The wake event itself is created
+        # fresh each iteration inside _dispatch_proc (no env exists yet here).
+        self._completions = queue.Queue()
+        self._wake = None
+
         # Admission controller: validates every placement the scheduler
         # proposes (§3.6). Callers may inject a configured one (custom
         # threshold/margin, NVML disabled for tests); by default it gates
@@ -188,11 +229,21 @@ class MultiTenantSimulation:
     def _now(self):
         return time.perf_counter() - self._t0
 
-    # ---- replay the trace: release each job at its planned arrival time ----
-    def _release_trace(self):
+    # ---- SimPy processes ----------------------------------------------------
+    def _arrival_proc(self, env):
+        """SimPy arrival process: replay the trace, yielding ``env.timeout()``
+        for each inter-arrival gap and releasing the job into the global
+        queue at its planned arrival time. The realtime environment turns
+        those timeouts into wall-clock waits, so arrivals land on schedule.
+
+        A user stop simply abandons the remainder of the trace: the dispatch
+        process is what ends the run, so this process just returns."""
         for job in self.trace:
-            if self._sleep_until(job.arrival_time):
-                return  # stopped before this job's arrival
+            delay = job.arrival_time - env.now
+            if delay > 0:
+                yield env.timeout(delay)
+            if self.stop_flag.is_set():
+                return
             with self._lock:
                 self.pending.append(job)
                 self.active_jobs[job.job_id] = {
@@ -204,17 +255,43 @@ class MultiTenantSimulation:
                     "start_time": None,          # set when a server begins it
                 }
             self._snapshot()
-            self._dispatch()  # place it now, so global-queue wait isn't just poll latency
+            # Wake the dispatcher at this same sim-instant (same-thread, so
+            # succeeding its event directly is safe), so global-queue wait
+            # isn't just poll latency.
+            self._notify_dispatch()
 
-    def _sleep_until(self, target):
-        """Sleep until `target` seconds after run start, in small chunks so a
-        stop is honoured promptly. Return True if stopped, False on arrival."""
+    def _notify_dispatch(self):
+        """Succeed the dispatch process's wake event. Only callable from the
+        SimPy thread (i.e. from other processes such as arrivals) -- foreign
+        threads must go through the _completions queue instead."""
+        if self._wake is not None and not self._wake.triggered:
+            self._wake.succeed()
+
+    def _dispatch_proc(self, env):
+        """SimPy dispatch process -- the run's driver. Each iteration drains
+        completion tokens signalled by the server threads, runs one dispatch
+        pass (scheduler -> admission -> placement), and then waits for the
+        next arrival wake / completion token / heartbeat tick. The run ends
+        when every trace job has finished (or the user stops)."""
         while not self.stop_flag.is_set():
-            remaining = target - self._now()
-            if remaining <= 0:
-                return False
-            time.sleep(min(0.05, remaining))
-        return True
+            # Absorb completion signals from the server threads. Bookkeeping
+            # already happened in _on_job_done (lock-protected); the token is
+            # purely a "something freed up, dispatch again" wake signal.
+            while True:
+                try:
+                    self._completions.get_nowait()
+                except queue.Empty:
+                    break
+            self._dispatch()
+            if self._is_complete():
+                return
+            # Heartbeat snapshot keeps waiting jobs' live wait times ticking
+            # in the UI even when nothing starts or finishes this interval.
+            self._snapshot()
+            # Sleep until an arrival wakes us or the poll interval elapses
+            # (the poll bounds completion-signal latency and stop latency).
+            self._wake = env.event()
+            yield self._wake | env.timeout(DISPATCH_POLL_S)
 
     # ---- placement: scheduler proposes, admission validates, engine commits ----
     def _partition_view(self):
@@ -394,9 +471,11 @@ class MultiTenantSimulation:
                 })
             self.completed += 1
         self._snapshot()
-        # A slot just freed: offer any globally-queued jobs (schedulers that
-        # decline busy servers) a server now rather than on the next heartbeat.
-        self._dispatch()
+        # A slot just freed: signal the SimPy dispatch process so globally-
+        # queued jobs are offered a server on its next wake (bounded by
+        # DISPATCH_POLL_S). This thread must not touch env directly -- SimPy's
+        # event calendar is not thread-safe -- hence the queue token.
+        self._completions.put(job.job_id)
 
     def build_summary(self):
         """Return the per-run summary over the results log (see
@@ -503,23 +582,40 @@ class MultiTenantSimulation:
         self.event_q.put(payload)
 
     def run(self):
+        # Warm up CUDA before the clocks start: the first kernel launch of a
+        # process pays ~1s of context initialization, which starves the GIL
+        # and would freeze the arrival/dispatch processes mid-run (measured:
+        # arrivals land ~1s late on a cold context vs ~10ms warm). Doing it
+        # here, before _t0 / env.sync(), keeps it out of every measurement.
+        if torch.cuda.is_available():
+            torch.zeros(1, device="cuda").item()
+            torch.cuda.synchronize()
+
         for s in self.servers:
             s.start()
-        releaser = threading.Thread(target=self._release_trace, daemon=True)
-        releaser.start()
 
-        # Run until the trace is exhausted and drained, or the user stops. A
-        # heartbeat snapshot each pass keeps waiting jobs' live wait times ticking
-        # in the UI even when no job has started or finished this interval.
-        while not self.stop_flag.is_set():
-            self._dispatch()
-            if self._is_complete():
-                break
-            self._snapshot()
-            time.sleep(0.1)
+        # The SimPy half of the hybrid: a realtime environment pins the event
+        # clock to the wall clock (factor=1), because job execution is real
+        # PyTorch work taking real time. strict=False, so a slow step (e.g. a
+        # CPU matmul hogging cores, or a long dispatch pass) degrades to
+        # "catch up" instead of raising -- the lifecycle timestamps are
+        # measured with a monotonic clock anyway, not derived from env.now.
+        env = simpy.rt.RealtimeEnvironment(factor=1.0, strict=False)
+        env.process(self._arrival_proc(env))
+        dispatcher = env.process(self._dispatch_proc(env))
+        # Anchor both clocks to the same instant: sim_time 0 (_now's epoch)
+        # == env.now 0 (sync() resets the environment's real-time epoch).
+        self._t0 = time.perf_counter()
+        env.sync()
+        # The dispatch process is the run's driver: it returns when the whole
+        # trace has finished, or when the user stops. Arrival events still
+        # pending at that point are simply never executed.
+        env.run(until=dispatcher)
 
-        # graceful shutdown: let in-flight jobs finish, then join workers
-        releaser.join(timeout=1.0)
+        # Graceful shutdown. On natural completion every job has finished
+        # (dispatcher exits on completed == total), so raising stop_flag just
+        # lets the idle server threads exit their poll loops and join.
+        self.stop_flag.set()
         for s in self.servers:
             s.join(timeout=2.0)
 
