@@ -5,7 +5,7 @@ import threading
 
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
-from Workload.workload import DEFAULT_TENANTS, WORKLOAD_TYPES
+from Workload.workload import WORKLOAD_TYPES, make_tenants, generate_trace
 from Scheduling_control.loader import load_schedulers
 
 class Dashboard(tk.Tk):
@@ -20,6 +20,7 @@ class Dashboard(tk.Tk):
         self.event_q = None
         self.stop_flag = None
         self.worker = None
+        self._user_stopped = False
 
         # Scheduling algorithms the user can pick; each decides how tenants map
         # to GPUs/servers. Discovered from the schedulers/ plugin directory and
@@ -27,12 +28,14 @@ class Dashboard(tk.Tk):
         # instance is created per run (some are stateful).
         self.schedulers = load_schedulers()
 
-        # Tenants that generate the simulated workload, plus a color lookup
-        # used to shade the GPU grid by owning tenant.
-        self.tenants = DEFAULT_TENANTS
+        self._build_config_panel()
+
+        # Tenants that generate the simulated workload, plus a color lookup used
+        # to shade the GPU grid by owning tenant. The set is derived from the
+        # experiment config and rebuilt on every run (see _apply_tenant_config).
+        self.tenants = make_tenants(self.num_tenants_var.get())
         self.tenant_colors = {t.tenant_id: t.color for t in self.tenants}
 
-        self._build_config_panel()
         self._build_gpu_grid_panel()
         self._build_queue_panel()
         self._build_tenant_panel()
@@ -45,31 +48,65 @@ class Dashboard(tk.Tk):
     def _build_config_panel(self):
         frame = ttk.LabelFrame(self, text="Configuration")
         frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        ttk.Label(frame, text="Number of GPUs:").pack(side="left", padx=5)
+
+        # --- row 1: hardware + scheduler + run controls ---
+        row1 = ttk.Frame(frame)
+        row1.pack(fill="x", padx=5, pady=(4, 2))
+
+        ttk.Label(row1, text="Number of GPUs:").pack(side="left", padx=5)
         self.gpu_count_var = tk.IntVar(value=4)
-        self.gpu_spinbox = ttk.Spinbox(frame, from_=1, to=16, textvariable=self.gpu_count_var, width=5)
+        self.gpu_spinbox = ttk.Spinbox(row1, from_=1, to=16, textvariable=self.gpu_count_var, width=5)
         self.gpu_spinbox.pack(side="left", padx=5)
 
-        ttk.Label(frame, text="Scheduler:").pack(side="left", padx=(15, 5))
+        ttk.Label(row1, text="Scheduler:").pack(side="left", padx=(15, 5))
         self.scheduler_var = tk.StringVar()
         self.scheduler_combo = ttk.Combobox(
-            frame, textvariable=self.scheduler_var, state="readonly", width=28,
+            row1, textvariable=self.scheduler_var, state="readonly", width=28,
         )
         self.scheduler_combo.pack(side="left", padx=5)
         self._refresh_scheduler_combo()
 
-        self.reload_btn = ttk.Button(frame, text="Reload schedulers",
+        self.reload_btn = ttk.Button(row1, text="Reload schedulers",
                                      command=self._reload_schedulers)
         self.reload_btn.pack(side="left", padx=5)
 
-        self.start_btn = ttk.Button(frame, text="Start Simulation", command=self._start_simulation)
+        self.start_btn = ttk.Button(row1, text="Start Simulation", command=self._start_simulation)
         self.start_btn.pack(side="left", padx=5)
-        self.stop_btn = ttk.Button(frame, text="Stop Simulation", command=self._stop_simulation, state=tk.DISABLED)
+        self.stop_btn = ttk.Button(row1, text="Stop Simulation", command=self._stop_simulation, state=tk.DISABLED)
         self.stop_btn.pack(side="left", padx=5)
-        
-        self.status_var = tk.StringVar(value="Simulation not started. -- Choose GPU count and click 'Start'")
-        ttk.Label(frame, textvariable=self.status_var).pack(side="left", padx=10)
+
+        # --- row 2: experiment config (defines the finite, seeded job trace) ---
+        row2 = ttk.Frame(frame)
+        row2.pack(fill="x", padx=5, pady=(2, 4))
+
+        # A run is fully determined by (number of tenants, per-tenant counts of
+        # each workload type, seed). These are the knobs for that.
+        ttk.Label(row2, text="Tenants:").pack(side="left", padx=(5, 2))
+        self.num_tenants_var = tk.IntVar(value=3)
+        self.tenants_spinbox = ttk.Spinbox(row2, from_=1, to=12, width=4,
+                                           textvariable=self.num_tenants_var)
+        self.tenants_spinbox.pack(side="left", padx=(0, 10))
+
+        # Per-tenant counts for each workload type; each tenant contributes this
+        # many light / medium / heavy jobs to the trace.
+        self.count_vars = {}
+        self.count_spinboxes = []
+        for name, default in (("light", 4), ("medium", 3), ("heavy", 1)):
+            ttk.Label(row2, text=f"{name.capitalize()}/tenant:").pack(side="left", padx=(5, 2))
+            var = tk.IntVar(value=default)
+            sb = ttk.Spinbox(row2, from_=0, to=99, width=4, textvariable=var)
+            sb.pack(side="left", padx=(0, 8))
+            self.count_vars[name] = var
+            self.count_spinboxes.append(sb)
+
+        ttk.Label(row2, text="Seed:").pack(side="left", padx=(10, 2))
+        self.seed_var = tk.IntVar(value=0)
+        self.seed_spinbox = ttk.Spinbox(row2, from_=0, to=999999, width=8,
+                                        textvariable=self.seed_var)
+        self.seed_spinbox.pack(side="left", padx=(0, 5))
+
+        self.status_var = tk.StringVar(value="Simulation not started. -- Configure the experiment and click 'Start'")
+        ttk.Label(frame, textvariable=self.status_var).pack(anchor="w", padx=10, pady=(0, 4))
 
     def _refresh_scheduler_combo(self):
         """Point the dropdown at the current self.schedulers, preserving the
@@ -115,16 +152,29 @@ class Dashboard(tk.Tk):
         self.queue_tree.pack(side="left", fill="both", expand=True, padx=5, pady=5)
         vsb.pack(side="right", fill="y")
 
-        # Shade each row by its owning tenant so the queue is scannable at a glance.
+        self._apply_queue_tenant_tags()
+
+    def _apply_queue_tenant_tags(self):
+        """Shade each queue row by its owning tenant so the table is scannable
+        at a glance. Re-run whenever the tenant set changes."""
         for tenant in self.tenants:
             self.queue_tree.tag_configure(tenant.tenant_id, background=tenant.color)
 
     def _build_tenant_panel(self):
         frame = ttk.LabelFrame(self, text="Tenants")
         frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.tenant_frame = frame
+        self.tenant_vars = {}
+        self._populate_tenant_rows()
+
+    def _populate_tenant_rows(self):
+        """(Re)build one stats row per tenant. Called at init and again on each
+        run, since the tenant set is regenerated from the experiment config."""
+        for child in self.tenant_frame.winfo_children():
+            child.destroy()
         self.tenant_vars = {}
         for tenant in self.tenants:
-            row = ttk.Frame(frame)
+            row = ttk.Frame(self.tenant_frame)
             row.pack(fill="x", padx=5, pady=2)
             swatch = tk.Canvas(row, width=14, height=14, highlightthickness=0)
             swatch.create_rectangle(0, 0, 14, 14, fill=tenant.color, outline="")
@@ -159,21 +209,50 @@ class Dashboard(tk.Tk):
     def _set_controls_enabled(self, enabled: bool):
         state = tk.NORMAL if enabled else tk.DISABLED
         self.gpu_spinbox.config(state=state)
+        self.tenants_spinbox.config(state=state)
+        for sb in self.count_spinboxes:
+            sb.config(state=state)
+        self.seed_spinbox.config(state=state)
         # readonly combobox re-enables to "readonly", not plain NORMAL
         self.scheduler_combo.config(state="readonly" if enabled else tk.DISABLED)
         self.reload_btn.config(state=state)
         self.start_btn.config(state=state)
         self.stop_btn.config(state=tk.NORMAL if not enabled else tk.DISABLED)
-        
-    def _start_simulation(self):
+
+    def _read_experiment_config(self):
+        """Validate and return (capacity, num_tenants, counts, seed) from the
+        config widgets, or None (after setting a status message) if invalid."""
         try:
             capacity = int(self.gpu_count_var.get())
+            num_tenants = int(self.num_tenants_var.get())
+            counts = {name: int(var.get()) for name, var in self.count_vars.items()}
+            seed = int(self.seed_var.get())
         except (tk.TclError, ValueError):
-            self.status_var.set("Enter a valid integer GPU count")
-            return
+            self.status_var.set("Enter valid integers for GPUs, tenants, counts, and seed")
+            return None
         if capacity < 1:
             self.status_var.set("GPU count must be at least 1")
+            return None
+        if num_tenants < 1:
+            self.status_var.set("Number of tenants must be at least 1")
+            return None
+        if sum(counts.values()) < 1:
+            self.status_var.set("Set at least one job per tenant (light/medium/heavy)")
+            return None
+        return capacity, num_tenants, counts, seed
+
+    def _apply_tenant_config(self, num_tenants):
+        """Rebuild the tenant set (and the widgets keyed by it) for a new run."""
+        self.tenants = make_tenants(num_tenants)
+        self.tenant_colors = {t.tenant_id: t.color for t in self.tenants}
+        self._populate_tenant_rows()
+        self._apply_queue_tenant_tags()
+
+    def _start_simulation(self):
+        config = self._read_experiment_config()
+        if config is None:
             return
+        capacity, num_tenants, counts, seed = config
 
         name = self.scheduler_var.get()
         if name not in self.schedulers:
@@ -181,31 +260,46 @@ class Dashboard(tk.Tk):
             return
         scheduler = self.schedulers[name]()
 
+        # Rebuild tenants for this run, then pre-generate the finite job trace.
+        # Same (num_tenants, counts, seed) => identical trace every run.
+        self._apply_tenant_config(num_tenants)
+        jobs = generate_trace(self.tenants, counts, seed)
+
+        self._user_stopped = False
         self._set_controls_enabled(False)
-        self.status_var.set(f"Running with {capacity} GPU(s) -- {self.scheduler_var.get()}")
+        self.status_var.set(
+            f"Running {len(jobs)} jobs on {capacity} GPU(s) -- {name} (seed {seed})"
+        )
+        # Reset the queue table so a previous run's rows don't linger.
+        self.queue_tree.delete(*self.queue_tree.get_children())
 
         self.event_q = queue.Queue()
         self.stop_flag = threading.Event()
         self.worker = threading.Thread(
             target=simulation_thread_main,
-            args=(self.event_q, self.stop_flag, capacity, self.tenants, scheduler),
+            args=(self.event_q, self.stop_flag, capacity, self.tenants, jobs, scheduler),
             daemon=True,
         )
         self.worker.start()
         self.after(100, self._poll_sim_queue)
 
     def _stop_simulation(self):
+        self._user_stopped = True
         if self.stop_flag:
             self.stop_flag.set()
         self.status_var.set("Stopping...")
-        self.after(50, self._check_worker_stopped)
 
-    def _check_worker_stopped(self):
-        if self.worker and self.worker.is_alive():
-            self.after(50, self._check_worker_stopped)
-            return
-        self.status_var.set("Simulation not started. -- Choose GPU count and click 'Start'")
+    def _finish_run(self, snapshot=None):
+        """Re-enable the controls once a run ends -- whether it finished its
+        whole trace or the user stopped it early."""
         self._set_controls_enabled(True)
+        if self._user_stopped:
+            self.status_var.set("Stopped. -- Adjust the config and click 'Start'")
+        elif snapshot is not None:
+            done = snapshot.get("completed", 0)
+            self.status_var.set(f"Run complete -- {done} job(s) finished. Adjust the config and click 'Start'")
+        else:
+            self.status_var.set("Run complete. -- Adjust the config and click 'Start'")
 
     # ---- simulation snapshot polling / rendering ----
     def _poll_sim_queue(self):
@@ -221,6 +315,18 @@ class Dashboard(tk.Tk):
             self._render_snapshot(snapshot)
         if self.worker and self.worker.is_alive():
             self.after(100, self._poll_sim_queue)
+        else:
+            # Worker has exited: the run is over. The engine's final done=True
+            # snapshot may have landed after our drain above, so sweep once more
+            # and render it before re-enabling the controls.
+            try:
+                while True:
+                    snapshot = self.event_q.get_nowait()
+            except queue.Empty:
+                pass
+            if snapshot:
+                self._render_snapshot(snapshot)
+            self._finish_run(snapshot)
 
     def _render_snapshot(self, snap):
         self.sim_time_var.set(f"t = {snap['sim_time']:.2f}")

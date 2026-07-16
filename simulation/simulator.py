@@ -15,7 +15,6 @@ GUI already consumes:
     {"sim_time", "capacity", "gpu_owner", "tenant_stats", "device"}
 """
 
-import itertools
 import queue
 import threading
 import time
@@ -25,7 +24,7 @@ from dataclasses import dataclass, field
 import torch
 
 from Scheduling_control.scheduler import Scheduler
-from Workload.workload import DEFAULT_TENANTS
+from Workload.workload import DEFAULT_TENANTS, build_experiment
 
 
 @dataclass
@@ -88,13 +87,17 @@ class Server(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class MultiTenantSimulation:
-    def __init__(self, event_q, stop_flag, capacity, tenants, scheduler=None):
+    def __init__(self, event_q, stop_flag, capacity, tenants, jobs, scheduler=None):
         self.event_q, self.stop_flag = event_q, stop_flag
         self.capacity = capacity
         self.tenants = list(tenants)
+        # The pre-generated job trace: a finite, ordered list of jobs, each with
+        # a planned arrival_time (seconds from run start). The run replays it and
+        # then ends -- it is not an open-ended stream.
+        self.trace = sorted(jobs, key=lambda j: j.arrival_time)
+        self.total_jobs = len(self.trace)
         self.scheduler = scheduler or _DefaultScheduler()
 
-        self._job_ids = itertools.count()
         self._t0 = time.perf_counter()
         self._lock = threading.Lock()
 
@@ -102,6 +105,7 @@ class MultiTenantSimulation:
         self.free = set(range(capacity))
         self.owner = {}                 # server index -> tenant currently on it
         self.active_jobs = {}           # job_id -> live record (queued/running)
+        self.completed = 0              # trace jobs finished so far
         self.stats = {
             t.tenant_id: {"queued": 0, "running": 0, "completed": 0}
             for t in self.tenants
@@ -116,14 +120,13 @@ class MultiTenantSimulation:
     def _now(self):
         return time.perf_counter() - self._t0
 
-    # ---- each tenant produces random workloads over time ----
-    def _produce(self, tenant):
-        while not self.stop_flag.is_set():
-            if self._interruptible_sleep(tenant.next_interarrival()):
-                break
-            job = tenant.make_job(next(self._job_ids), self._now())
+    # ---- replay the trace: release each job at its planned arrival time ----
+    def _release_trace(self):
+        for job in self.trace:
+            if self._sleep_until(job.arrival_time):
+                return  # stopped before this job's arrival
             with self._lock:
-                self.stats[tenant.tenant_id]["queued"] += 1
+                self.stats[job.tenant_id]["queued"] += 1
                 self.pending.append(job)
                 self.active_jobs[job.job_id] = {
                     "job_id": job.job_id, "tenant": job.tenant_id,
@@ -132,14 +135,15 @@ class MultiTenantSimulation:
                 }
             self._snapshot()
 
-    def _interruptible_sleep(self, delay):
-        """Sleep `delay` seconds in small chunks; return True if stopped."""
-        end = time.perf_counter() + delay
-        while time.perf_counter() < end:
-            if self.stop_flag.is_set():
-                return True
-            time.sleep(min(0.05, end - time.perf_counter()))
-        return False
+    def _sleep_until(self, target):
+        """Sleep until `target` seconds after run start, in small chunks so a
+        stop is honoured promptly. Return True if stopped, False on arrival."""
+        while not self.stop_flag.is_set():
+            remaining = target - self._now()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+        return True
 
     # ---- placement: ask the scheduler where each pending job goes ----
     def _dispatch(self):
@@ -191,11 +195,19 @@ class MultiTenantSimulation:
             self.active_jobs.pop(job.job_id, None)
             self.stats[job.tenant_id]["running"] -= 1
             self.stats[job.tenant_id]["completed"] += 1
+            self.completed += 1
         self._snapshot()
 
-    def _snapshot(self):
+    def _is_complete(self):
+        """The run is done once every trace job has finished. total_jobs is
+        known up front, so a completed count reaching it means all jobs were
+        released, dispatched, and executed."""
+        with self._lock:
+            return self.completed >= self.total_jobs
+
+    def _snapshot(self, done=False):
         # Build the payload under the lock so the job list stays consistent
-        # with owner/stats even while producer and server threads mutate them.
+        # with owner/stats even while the release and server threads mutate them.
         with self._lock:
             payload = {
                 "sim_time": self._now(),
@@ -204,31 +216,43 @@ class MultiTenantSimulation:
                 "tenant_stats": {t: dict(s) for t, s in self.stats.items()},
                 "device": self.device_desc,
                 "jobs": [dict(r) for r in self.active_jobs.values()],
+                "completed": self.completed,
+                "total": self.total_jobs,
+                "done": done,
             }
         self.event_q.put(payload)
 
     def run(self):
         for s in self.servers:
             s.start()
-        producers = [
-            threading.Thread(target=self._produce, args=(t,), daemon=True)
-            for t in self.tenants
-        ]
-        for p in producers:
-            p.start()
+        releaser = threading.Thread(target=self._release_trace, daemon=True)
+        releaser.start()
 
+        # Run until the trace is exhausted and drained, or the user stops.
         while not self.stop_flag.is_set():
             self._dispatch()
+            if self._is_complete():
+                break
             time.sleep(0.02)
 
         # graceful shutdown: let in-flight jobs finish, then join workers
+        releaser.join(timeout=1.0)
         for s in self.servers:
             s.join(timeout=2.0)
-        for p in producers:
-            p.join(timeout=1.0)
+
+        # Final snapshot flags completion so the GUI can re-enable its controls.
+        self._snapshot(done=True)
 
 
-def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, scheduler=None):
-    sim = MultiTenantSimulation(event_q, stop_flag, capacity,
-                                tenants or DEFAULT_TENANTS, scheduler)
+def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None,
+                           scheduler=None):
+    if tenants is None or jobs is None:
+        # Standalone/default run: build a small reproducible experiment so the
+        # engine stays runnable without the UI supplying a config.
+        tenants, jobs = build_experiment(
+            num_tenants=len(DEFAULT_TENANTS),
+            counts={"light": 3, "medium": 2, "heavy": 1},
+            seed=0,
+        )
+    sim = MultiTenantSimulation(event_q, stop_flag, capacity, tenants, jobs, scheduler)
     sim.run()

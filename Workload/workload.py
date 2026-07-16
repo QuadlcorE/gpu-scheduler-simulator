@@ -45,10 +45,10 @@ WORKLOAD_TYPES = {w.name: w for w in (LIGHT, MEDIUM, HEAVY)}
 class Job:
     job_id: int
     tenant_id: str
-    size: int                 # NxN matrix dimension for the GEMM
-    iters: int                # number of matmul iterations
-    wtype: str = "medium"     # workload type name (key into WORKLOAD_TYPES)
-    submit_time: float = 0.0  # when the job arrived (real seconds)
+    size: int                  # NxN matrix dimension for the GEMM
+    iters: int                 # number of matmul iterations
+    wtype: str = "medium"      # workload type name (key into WORKLOAD_TYPES)
+    arrival_time: float = 0.0  # planned arrival, seconds from run start (from the trace)
     metrics: dict = field(default_factory=dict)  # filled in by run()
 
     def run(self, device):
@@ -84,33 +84,103 @@ class Tenant:
         self.arrival_rate = arrival_rate      # mean jobs per real second
         self.color = color
 
-    def next_interarrival(self):
-        """Random gap (real seconds) until this tenant submits its next job."""
-        return random.expovariate(self.arrival_rate)
+    def make_job(self, job_id, arrival_time, wtype, rng):
+        """Create one matmul workload for this tenant.
 
-    def make_job(self, job_id, submit_time, wtype=None):
-        """Create the next matmul workload for this tenant.
-
-        `wtype` selects the workload type (a WorkloadType, its name, or None
-        to pick one at random); the type fixes the matrix size and the range
-        the iteration count is drawn from."""
-        if wtype is None:
-            wtype = random.choice(list(WORKLOAD_TYPES.values()))
-        elif isinstance(wtype, str):
+        `wtype` selects the workload type (a WorkloadType or its name); the
+        type fixes the matrix size and the range the iteration count is drawn
+        from. `rng` is a dedicated ``random.Random`` instance so that a run is
+        reproducible from its seed -- the global RNG is never used here."""
+        if isinstance(wtype, str):
             wtype = WORKLOAD_TYPES[wtype]
         return Job(
             job_id=job_id,
             tenant_id=self.tenant_id,
             size=wtype.size,
-            iters=random.randint(*wtype.iter_range),
+            iters=rng.randint(*wtype.iter_range),
             wtype=wtype.name,
-            submit_time=submit_time,
+            arrival_time=arrival_time,
         )
 
 
-# Default tenants used when the caller does not supply its own set.
-DEFAULT_TENANTS = [
-    Tenant("TenantA", 1 / 2.0, color="#4caf50"),
-    Tenant("TenantB", 1 / 3.0, color="#2196f3"),
-    Tenant("TenantC", 1 / 5.0, color="#ff9800"),
+# ---------------------------------------------------------------------------
+# Experiment traces -- a run is a finite, pre-generated list of jobs.
+#
+# Given (number of tenants, per-tenant counts of each workload type, seed) we
+# generate the entire job list up front: each tenant's jobs, their workload
+# types, iteration counts, and arrival times are all drawn from one dedicated
+# ``random.Random(seed)`` instance. Same seed + same config => byte-for-byte
+# identical arrivals, sizes, and iteration counts on every run, which is what
+# makes two schedulers comparable.
+# ---------------------------------------------------------------------------
+
+# Distinct, high-contrast swatches assigned to tenants in order. Cycled if a
+# run asks for more tenants than there are colors.
+TENANT_PALETTE = [
+    "#4caf50", "#2196f3", "#ff9800", "#9c27b0", "#e91e63",
+    "#00bcd4", "#8bc34a", "#ff5722", "#3f51b5", "#795548",
+    "#009688", "#cddc39",
 ]
+
+# Mean jobs-per-second used to space one tenant's arrivals. The counts (not the
+# rate) decide how many jobs a run contains; the rate only sets their spacing.
+DEFAULT_ARRIVAL_RATE = 1 / 2.0
+
+
+def _tenant_name(index):
+    """TenantA, TenantB, ... TenantZ, then Tenant27, Tenant28, ..."""
+    if index < 26:
+        return f"Tenant{chr(ord('A') + index)}"
+    return f"Tenant{index + 1}"
+
+
+def make_tenants(num_tenants, arrival_rate=DEFAULT_ARRIVAL_RATE):
+    """Build `num_tenants` tenants with generated IDs and cycled palette colors."""
+    return [
+        Tenant(_tenant_name(i), arrival_rate, color=TENANT_PALETTE[i % len(TENANT_PALETTE)])
+        for i in range(num_tenants)
+    ]
+
+
+def generate_trace(tenants, counts, seed):
+    """Return the full, sorted list of jobs for one run.
+
+    `counts` is ``{"light": n, "medium": n, "heavy": n}`` -- the number of jobs
+    of each workload type *each* tenant contributes. Every random choice (job
+    ordering, iteration counts, arrival gaps) comes from a single
+    ``random.Random(seed)``, so the trace is fully determined by (tenants,
+    counts, seed). Jobs are returned sorted by arrival time with ids assigned
+    in arrival order.
+    """
+    rng = random.Random(seed)
+    jobs = []
+    for tenant in tenants:
+        # The multiset of workload types this tenant will submit, shuffled so
+        # its light/medium/heavy jobs are interleaved rather than blocked.
+        types = []
+        for name in ("light", "medium", "heavy"):
+            types += [name] * counts.get(name, 0)
+        rng.shuffle(types)
+
+        t = 0.0
+        for wtype in types:
+            t += rng.expovariate(tenant.arrival_rate)
+            # job_id is a placeholder here; reassigned in arrival order below.
+            jobs.append(tenant.make_job(0, arrival_time=t, wtype=wtype, rng=rng))
+
+    jobs.sort(key=lambda j: j.arrival_time)
+    for job_id, job in enumerate(jobs):
+        job.job_id = job_id
+    return jobs
+
+
+def build_experiment(num_tenants, counts, seed, arrival_rate=DEFAULT_ARRIVAL_RATE):
+    """Convenience wrapper: build the tenants and their job trace together."""
+    tenants = make_tenants(num_tenants, arrival_rate)
+    jobs = generate_trace(tenants, counts, seed)
+    return tenants, jobs
+
+
+# Default tenant set, used only for previews / standalone engine runs. A real
+# experiment builds its tenants from the UI config via `make_tenants`.
+DEFAULT_TENANTS = make_tenants(3)
