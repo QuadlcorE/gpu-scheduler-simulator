@@ -100,6 +100,13 @@ class Partition:
         with self._lock:
             return len(self._ledger)
 
+    @property
+    def largest_reservation_mb(self):
+        """The biggest single live reservation (0 when the ledger is empty).
+        The admission controller's "heavy job running" test reads this."""
+        with self._lock:
+            return max(self._ledger.values(), default=0)
+
     def snapshot(self):
         """Plain-dict view for UI snapshots / logs."""
         with self._lock:
