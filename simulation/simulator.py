@@ -6,9 +6,15 @@ each served by a worker thread bound to a torch device -- on the single-GPU
 setup all of them execute on the same physical cuda:0, and the partition
 supplies the policy state: a VRAM reservation ledger (declared mem_mb of jobs
 placed-and-not-finished) and a cooperative throttle flag that soft-enforces
-its compute share. Tenants generate random matmul workloads; the scheduler
-(Scheduling_control) decides which partition each job runs on; the server
-thread actually executes the workload on PyTorch and reports measured metrics.
+its compute share. Tenants generate random matmul workloads; each dispatch
+pass runs the scheduler -> admission -> placement pipeline: the scheduler
+(Scheduling_control) proposes (job, partition) placements from the global
+queue, the admission controller (the report's §3.6 four-step check) validates
+each proposal, and admitted jobs are handed to the partition's server thread,
+which actually executes the workload on PyTorch and reports measured metrics.
+A proposal the controller holds (QUEUE / THROTTLE_RUNNING) stays in the
+global queue for a later pass; a REJECTed job -- one whose declared demand
+could never fit any partition -- is removed and recorded as rejected.
 
 There is no virtual clock here -- unlike a discrete-event model, real PyTorch
 work takes real wall-clock time, so "sim_time" is simply seconds elapsed since
@@ -41,6 +47,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from Scheduling_control.admission import ADMIT, REJECT, AdmissionController
 from Scheduling_control.scheduler import Scheduler
 from Workload.workload import DEFAULT_TENANTS, build_experiment
 from simulation.partition import apply_compute_shares, build_partitions
@@ -118,7 +125,7 @@ class Server(threading.Thread):
 
 class MultiTenantSimulation:
     def __init__(self, event_q, stop_flag, capacity, tenants, jobs, scheduler=None,
-                 partitions=None):
+                 partitions=None, admission=None):
         self.event_q, self.stop_flag = event_q, stop_flag
         # Each server slot is the execution arm of one simulated MIG partition
         # (simulation.partition). Default: `capacity` equal slices of the
@@ -139,6 +146,13 @@ class MultiTenantSimulation:
         self._t0 = time.perf_counter()
         self._lock = threading.Lock()
 
+        # Admission controller: validates every placement the scheduler
+        # proposes (§3.6). Callers may inject a configured one (custom
+        # threshold/margin, NVML disabled for tests); by default it gates
+        # against this run's partition set with log timestamps on sim_time.
+        self.admission = admission if admission is not None else AdmissionController(
+            partitions=self.partitions, clock=self._now)
+
         self.pending = deque()          # jobs in the global queue (not yet placed)
         # Per-server load: jobs assigned to a server that have not finished
         # (waiting in its inbox + the one running). 0 means the server is idle.
@@ -157,6 +171,7 @@ class MultiTenantSimulation:
         self.stats = {
             t.tenant_id: {
                 "completed": 0,
+                "rejected": 0,
                 "global_wait_total": 0.0,
                 "server_wait_total": 0.0,
             }
@@ -201,55 +216,122 @@ class MultiTenantSimulation:
             time.sleep(min(0.05, remaining))
         return True
 
-    # ---- placement: ask the scheduler where each pending job goes ----
+    # ---- placement: scheduler proposes, admission validates, engine commits ----
+    def _partition_view(self):
+        """One dict per partition for the scheduler's `select` contract (see
+        Scheduling_control/scheduler.py). Call with self._lock held."""
+        view = []
+        for i, p in enumerate(self.partitions):
+            used = p.used_mb
+            view.append({
+                "index": i,
+                # "free" = its server is idle; queue_len is its real load --
+                # jobs waiting in its inbox plus the one running.
+                "free": self.server_load[i] == 0,
+                "tenant": self.owner.get(i),
+                "queue_len": self.server_load[i],
+                "cap_mb": p.vram_cap_mb,
+                "used_mb": used,
+                "headroom_mb": p.vram_cap_mb - used,
+                # How much MORE declared demand admission would accept right
+                # now: threshold-scaled cap, minus usage, minus safety margin.
+                "admit_headroom_mb": (self.admission.limit_mb(p) - used
+                                      - self.admission.safety_margin_mb),
+                "throttled": p.throttle.is_set(),
+                "share": p.compute_share,
+            })
+        return view
+
+    def _remove_pending(self, job):
+        """Drop `job` from the global queue by identity, preserving order of
+        the rest. Call with self._lock held."""
+        for k, j in enumerate(self.pending):
+            if j is job:
+                del self.pending[k]
+                return
+
+    def _commit(self, job, idx):
+        """Commit an ADMITted placement: reserve the job's declared demand on
+        the partition's ledger (held until completion) and hand it to the
+        server, where it queues if the server is busy. Call with lock held."""
+        self._remove_pending(job)
+        self.server_load[idx] += 1
+        self.partitions[idx].reserve(job)
+        rec = self.active_jobs.get(job.job_id)
+        if rec is not None:
+            rec["state"] = "server-queue"
+            rec["gpu"] = idx
+            rec["assign_time"] = self._now()  # leaves the global queue
+        self.servers[idx].submit(job)
+        self.scheduler.job_placed(job, idx)
+
+    def _reject(self, job):
+        """Finalize a REJECTed job: its declared demand can never fit any
+        partition, so it leaves the queue permanently and is recorded as a
+        rejected outcome (feeds the OOM-avoidance narrative -- these are the
+        placements that would otherwise have been guaranteed OOMs). Counts
+        toward run completion. Call with self._lock held."""
+        self._remove_pending(job)
+        now = self._now()
+        rec = self.active_jobs.pop(job.job_id, None)
+        submit = rec["submit_time"] if rec is not None else now
+        self.stats[job.tenant_id]["rejected"] += 1
+        self.results.append({
+            "job_id": job.job_id,
+            "tenant": job.tenant_id,
+            "wtype": job.wtype,
+            "size": job.size,
+            "iters": job.iters,
+            "arrival_s": job.arrival_time,
+            "global_wait_s": now - submit,
+            "server_wait_s": 0.0,
+            "run_s": 0.0,
+            "gpu": None,
+            "start_s": None,
+            "end_s": now,
+            "mem_mb": job.mem_mb,
+            "priority": job.priority,
+            "admission": REJECT,
+            "oom": False,
+            "throttled": False,
+        })
+        self.completed += 1
+
     def _dispatch(self):
-        assigned = False
+        """One dispatch pass: repeatedly ask the scheduler for its next
+        (job, partition) proposal and validate it with the admission
+        controller. ADMIT commits the placement; REJECT removes the job for
+        good; QUEUE / THROTTLE_RUNNING leave it in the global queue but stop
+        offering it this pass (it is offered again on the next one)."""
+        changed = False
         with self._lock:
             if not self.pending:
                 return
-            # A server is "free" when nothing is assigned to it (load 0);
-            # queue_len is its real load -- jobs waiting in its inbox plus the
-            # one running. The scheduler may pick a busy server to queue behind.
-            # The partition fields expose each slice's memory state (from its
-            # reservation ledger) so placement can be memory-aware.
-            view = [
-                {
-                    "index": i,
-                    "free": self.server_load[i] == 0,
-                    "tenant": self.owner.get(i),
-                    "queue_len": self.server_load[i],
-                    "cap_mb": self.partitions[i].vram_cap_mb,
-                    "used_mb": self.partitions[i].used_mb,
-                    "headroom_mb": self.partitions[i].headroom_mb,
-                }
-                for i in range(self.capacity)
-            ]
-            still_pending = deque()
-            while self.pending:
-                job = self.pending.popleft()
-                idx = self.scheduler.select_server(job, view)
-                if idx is not None and 0 <= idx < self.capacity:
-                    # Place the job on server idx; it queues there if busy.
-                    # Its declared demand is reserved on the partition's ledger
-                    # from placement until completion.
-                    self.server_load[idx] += 1
-                    self.partitions[idx].reserve(job)
-                    rec = self.active_jobs.get(job.job_id)
-                    if rec is not None:
-                        rec["state"] = "server-queue"
-                        rec["gpu"] = idx
-                        rec["assign_time"] = self._now()  # leaves the global queue
-                    # Reflect the new load so later jobs in this pass see it.
-                    view[idx]["free"] = False
-                    view[idx]["queue_len"] = self.server_load[idx]
-                    view[idx]["used_mb"] = self.partitions[idx].used_mb
-                    view[idx]["headroom_mb"] = self.partitions[idx].headroom_mb
-                    self.servers[idx].submit(job)
-                    assigned = True
-                else:
-                    still_pending.append(job)  # scheduler holds it in the global queue
-            self.pending = still_pending
-        if assigned:
+            # Jobs still on offer this pass, in global-queue (arrival) order.
+            # A job leaves this list once proposed, whatever the outcome, so
+            # the pass always terminates.
+            offered = list(self.pending)
+            while offered:
+                proposal = self.scheduler.select(list(offered),
+                                                 self._partition_view())
+                if proposal is None:
+                    break  # scheduler has nothing more to place this pass
+                job, idx = proposal
+                pos = next((k for k, j in enumerate(offered) if j is job), None)
+                if pos is None or not (0 <= idx < self.capacity):
+                    break  # defensive: unknown job / bad index ends the pass
+                del offered[pos]
+                outcome = self.admission.decide(job, self.partitions[idx])
+                if outcome == ADMIT:
+                    self._commit(job, idx)
+                    changed = True
+                elif outcome == REJECT:
+                    self._reject(job)
+                    changed = True
+                # QUEUE / THROTTLE_RUNNING: the job stays in self.pending and
+                # is retried on a later pass (triggered by the next arrival,
+                # completion, or heartbeat).
+        if changed:
             self._snapshot()
 
     # ---- a server began executing a job (called from the server thread) ----
@@ -266,6 +348,11 @@ class MultiTenantSimulation:
     # ---- a server finished a job (called from the server thread) ----
     def _on_job_done(self, index, job, metrics):
         self.partitions[index].release(job)  # frees its VRAM reservation
+        # The partition may drop back under its admission threshold now: let
+        # the controller release a throttle flag it raised (THROTTLE_RUNNING).
+        self.admission.reconsider(self.partitions[index])
+        # Completion feedback for stateful policies (e.g. fair-share tallies).
+        self.scheduler.job_finished(job, index, metrics)
         with self._lock:
             self.server_load[index] -= 1
             if self.running_job.get(index) == job.job_id:
@@ -298,6 +385,12 @@ class MultiTenantSimulation:
                     "gpu": index,
                     "start_s": start,
                     "end_s": self._now(),
+                    # Admission/execution outcomes (mirrored by _reject rows).
+                    "mem_mb": job.mem_mb,
+                    "priority": job.priority,
+                    "admission": ADMIT,
+                    "oom": bool(metrics.get("oom", False)),
+                    "throttled": bool(metrics.get("throttled", False)),
                 })
             self.completed += 1
         self._snapshot()
@@ -342,13 +435,16 @@ class MultiTenantSimulation:
                 d["server_wait"] = server_wait
                 jobs.append(d)
 
-            # Completed jobs stay in the table (the UI grays them out) instead
+            # Finished jobs stay in the table (the UI grays them out) instead
             # of vanishing: append their finalized rows from the results log.
+            # Rejected jobs (admission REJECT) are flagged as such.
             for r in self.results:
                 jobs.append({
                     "job_id": r["job_id"], "tenant": r["tenant"],
                     "wtype": r["wtype"], "size": r["size"], "iters": r["iters"],
-                    "state": "completed", "gpu": r["gpu"],
+                    "state": ("rejected" if r.get("admission") == REJECT
+                              else "completed"),
+                    "gpu": r["gpu"],
                     "global_wait": r["global_wait_s"],
                     "server_wait": r["server_wait_s"],
                 })
@@ -371,6 +467,7 @@ class MultiTenantSimulation:
                     "waiting": live[t]["waiting"],
                     "running": live[t]["running"],
                     "completed": done_n,
+                    "rejected": s["rejected"],
                     "global_wait_total": s["global_wait_total"],
                     "server_wait_total": s["server_wait_total"],
                     "avg_global_wait": s["global_wait_total"] / done_n if done_n else 0.0,
@@ -384,6 +481,8 @@ class MultiTenantSimulation:
                 "server_queue": list(self.server_load),
                 # Per-partition memory/throttle state (ledger-based used/cap).
                 "partitions": [p.snapshot() for p in self.partitions],
+                # Admission-decision counters + currently throttled partitions.
+                "admission": self.admission.snapshot(),
                 "tenant_stats": tenant_stats,
                 "device": self.device_desc,
                 "jobs": jobs,
@@ -397,6 +496,10 @@ class MultiTenantSimulation:
             if done:
                 payload["results"] = list(self.results)
                 payload["summary"] = summarize(list(self.results), self.capacity)
+                # Full decision/throttle history, so the UI can export the
+                # admission-log CSV without reaching into the simulator thread.
+                payload["admission_log"] = list(self.admission.log)
+                payload["throttle_log"] = list(self.admission.throttle_log)
         self.event_q.put(payload)
 
     def run(self):
@@ -425,7 +528,7 @@ class MultiTenantSimulation:
 
 
 def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None,
-                           scheduler=None, partitions=None):
+                           scheduler=None, partitions=None, admission=None):
     if tenants is None or jobs is None:
         # Standalone/default run: build a small reproducible experiment so the
         # engine stays runnable without the UI supplying a config.
@@ -435,5 +538,5 @@ def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None
             seed=0,
         )
     sim = MultiTenantSimulation(event_q, stop_flag, capacity, tenants, jobs, scheduler,
-                                partitions=partitions)
+                                partitions=partitions, admission=admission)
     sim.run()
