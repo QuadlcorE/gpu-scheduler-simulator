@@ -159,7 +159,8 @@ class Server(threading.Thread):
 
 class MultiTenantSimulation:
     def __init__(self, event_q, stop_flag, capacity, tenants, jobs, scheduler=None,
-                 partitions=None, admission=None):
+                 partitions=None, admission=None, threshold_pct=None,
+                 safety_margin_mb=None):
         self.event_q, self.stop_flag = event_q, stop_flag
         # Each server slot is the execution arm of one simulated MIG partition
         # (simulation.partition). Default: `capacity` equal slices of the
@@ -192,8 +193,19 @@ class MultiTenantSimulation:
         # proposes (§3.6). Callers may inject a configured one (custom
         # threshold/margin, NVML disabled for tests); by default it gates
         # against this run's partition set with log timestamps on sim_time.
-        self.admission = admission if admission is not None else AdmissionController(
-            partitions=self.partitions, clock=self._now)
+        # threshold_pct / safety_margin_mb are the §3.8 experiment knobs --
+        # passing them here (rather than a whole controller) keeps the log
+        # clock aligned with sim_time.
+        if admission is not None:
+            self.admission = admission
+        else:
+            adm_kwargs = {}
+            if threshold_pct is not None:
+                adm_kwargs["threshold_pct"] = threshold_pct
+            if safety_margin_mb is not None:
+                adm_kwargs["safety_margin_mb"] = safety_margin_mb
+            self.admission = AdmissionController(
+                partitions=self.partitions, clock=self._now, **adm_kwargs)
 
         # Run-scoped telemetry sampler (§3.3.2): for the duration of the run
         # it samples measured GPU util + VRAM (NVML) alongside each partition's
@@ -642,7 +654,8 @@ class MultiTenantSimulation:
 
 
 def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None,
-                           scheduler=None, partitions=None, admission=None):
+                           scheduler=None, partitions=None, admission=None,
+                           threshold_pct=None, safety_margin_mb=None):
     if tenants is None or jobs is None:
         # Standalone/default run: build a small reproducible experiment so the
         # engine stays runnable without the UI supplying a config.
@@ -652,5 +665,7 @@ def simulation_thread_main(event_q, stop_flag, capacity, tenants=None, jobs=None
             seed=0,
         )
     sim = MultiTenantSimulation(event_q, stop_flag, capacity, tenants, jobs, scheduler,
-                                partitions=partitions, admission=admission)
+                                partitions=partitions, admission=admission,
+                                threshold_pct=threshold_pct,
+                                safety_margin_mb=safety_margin_mb)
     sim.run()

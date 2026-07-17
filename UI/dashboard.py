@@ -7,7 +7,8 @@ import threading
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
 from simulation.results import export_run
-from Workload.workload import WORKLOAD_TYPES, make_tenants, generate_trace
+from Workload.workload import (DEFAULT_ARRIVAL_RATE, WORKLOAD_TYPES,
+                               make_tenants, generate_trace)
 from Scheduling_control.loader import load_schedulers
 
 class Dashboard(tk.Tk):
@@ -52,6 +53,7 @@ class Dashboard(tk.Tk):
         self.tenant_colors = {t.tenant_id: t.color for t in self.tenants}
 
         self._build_gpu_grid_panel()
+        self._build_admission_panel()
         self._build_queue_panel()
         self._build_tenant_panel()
         self._build_hw_panel()
@@ -68,7 +70,9 @@ class Dashboard(tk.Tk):
         row1 = ttk.Frame(frame)
         row1.pack(fill="x", padx=5, pady=(4, 2))
 
-        ttk.Label(row1, text="Number of GPUs:").pack(side="left", padx=5)
+        # Each "GPU" slot is one simulated MIG partition (§3.8 iii): an equal
+        # slice of the physical VRAM, served by its own worker thread.
+        ttk.Label(row1, text="Partitions (GPUs):").pack(side="left", padx=5)
         self.gpu_count_var = tk.IntVar(value=4)
         self.gpu_spinbox = ttk.Spinbox(row1, from_=1, to=16, textvariable=self.gpu_count_var, width=5)
         self.gpu_spinbox.pack(side="left", padx=5)
@@ -120,6 +124,28 @@ class Dashboard(tk.Tk):
                                         textvariable=self.seed_var)
         self.seed_spinbox.pack(side="left", padx=(0, 5))
 
+        # --- row 3: §3.8 knobs -- arrival intensity + admission control ---
+        row3 = ttk.Frame(frame)
+        row3.pack(fill="x", padx=5, pady=(2, 4))
+
+        ttk.Label(row3, text="Arrival rate (jobs/s/tenant):").pack(side="left", padx=(5, 2))
+        self.arrival_rate_var = tk.DoubleVar(value=DEFAULT_ARRIVAL_RATE)
+        self.arrival_spinbox = ttk.Spinbox(row3, from_=0.05, to=20.0, increment=0.05,
+                                           width=6, textvariable=self.arrival_rate_var)
+        self.arrival_spinbox.pack(side="left", padx=(0, 10))
+
+        ttk.Label(row3, text="Adm. threshold %:").pack(side="left", padx=(5, 2))
+        self.threshold_var = tk.IntVar(value=90)
+        self.threshold_spinbox = ttk.Spinbox(row3, from_=10, to=100, increment=5,
+                                             width=5, textvariable=self.threshold_var)
+        self.threshold_spinbox.pack(side="left", padx=(0, 10))
+
+        ttk.Label(row3, text="Safety margin (MB):").pack(side="left", padx=(5, 2))
+        self.margin_var = tk.IntVar(value=64)
+        self.margin_spinbox = ttk.Spinbox(row3, from_=0, to=2048, increment=16,
+                                          width=6, textvariable=self.margin_var)
+        self.margin_spinbox.pack(side="left", padx=(0, 10))
+
         self.status_var = tk.StringVar(value="Simulation not started. -- Configure the experiment and click 'Start'")
         ttk.Label(frame, textvariable=self.status_var).pack(anchor="w", padx=10, pady=(0, 4))
 
@@ -145,6 +171,19 @@ class Dashboard(tk.Tk):
         ttk.Label(frame, textvariable=self.sim_time_var).pack(anchor="w")
         self.grid_canvas = tk.Canvas(frame, height=120, bg="white")
         self.grid_canvas.pack(fill="x", padx=5, pady=5)
+
+    def _build_admission_panel(self):
+        """Live admission-control view: outcome counters plus a rolling feed
+        of the most recent scheduling decisions and throttle events."""
+        frame = ttk.LabelFrame(self, text="Admission control  (scheduling decisions / throttling events)")
+        frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.admission_counters_var = tk.StringVar(
+            value="decisions: 0   admit: 0   queue: 0   reject: 0   throttle: 0   throttled now: —")
+        ttk.Label(frame, textvariable=self.admission_counters_var).pack(
+            anchor="w", padx=5, pady=(2, 0))
+        self.admission_list = tk.Listbox(frame, height=5, font=("Consolas", 9),
+                                         activestyle="none")
+        self.admission_list.pack(fill="x", padx=5, pady=(2, 4))
 
     def _build_queue_panel(self):
         frame = ttk.LabelFrame(self, text="Job Queue  (generated jobs and their assigned GPU)")
@@ -238,6 +277,9 @@ class Dashboard(tk.Tk):
         for sb in self.count_spinboxes:
             sb.config(state=state)
         self.seed_spinbox.config(state=state)
+        self.arrival_spinbox.config(state=state)
+        self.threshold_spinbox.config(state=state)
+        self.margin_spinbox.config(state=state)
         # readonly combobox re-enables to "readonly", not plain NORMAL
         self.scheduler_combo.config(state="readonly" if enabled else tk.DISABLED)
         self.reload_btn.config(state=state)
@@ -245,18 +287,22 @@ class Dashboard(tk.Tk):
         self.stop_btn.config(state=tk.NORMAL if not enabled else tk.DISABLED)
 
     def _read_experiment_config(self):
-        """Validate and return (capacity, num_tenants, counts, seed) from the
-        config widgets, or None (after setting a status message) if invalid."""
+        """Validate and return the experiment config dict from the widgets, or
+        None (after setting a status message) if invalid."""
         try:
             capacity = int(self.gpu_count_var.get())
             num_tenants = int(self.num_tenants_var.get())
             counts = {name: int(var.get()) for name, var in self.count_vars.items()}
             seed = int(self.seed_var.get())
+            arrival_rate = float(self.arrival_rate_var.get())
+            threshold_pct = float(self.threshold_var.get())
+            safety_margin_mb = int(self.margin_var.get())
         except (tk.TclError, ValueError):
-            self.status_var.set("Enter valid integers for GPUs, tenants, counts, and seed")
+            self.status_var.set("Enter valid numbers for partitions, tenants, counts, "
+                                "seed, arrival rate, threshold, and margin")
             return None
         if capacity < 1:
-            self.status_var.set("GPU count must be at least 1")
+            self.status_var.set("Partition count must be at least 1")
             return None
         if num_tenants < 1:
             self.status_var.set("Number of tenants must be at least 1")
@@ -264,11 +310,28 @@ class Dashboard(tk.Tk):
         if sum(counts.values()) < 1:
             self.status_var.set("Set at least one job per tenant (light/medium/heavy)")
             return None
-        return capacity, num_tenants, counts, seed
+        if arrival_rate <= 0:
+            self.status_var.set("Arrival rate must be greater than 0")
+            return None
+        if not 0 < threshold_pct <= 100:
+            self.status_var.set("Admission threshold must be in (0, 100] %")
+            return None
+        if safety_margin_mb < 0:
+            self.status_var.set("Safety margin must be 0 MB or more")
+            return None
+        return {
+            "capacity": capacity,
+            "num_tenants": num_tenants,
+            "counts": counts,
+            "seed": seed,
+            "arrival_rate": arrival_rate,
+            "threshold_pct": threshold_pct,
+            "safety_margin_mb": safety_margin_mb,
+        }
 
-    def _apply_tenant_config(self, num_tenants):
+    def _apply_tenant_config(self, num_tenants, arrival_rate=DEFAULT_ARRIVAL_RATE):
         """Rebuild the tenant set (and the widgets keyed by it) for a new run."""
-        self.tenants = make_tenants(num_tenants)
+        self.tenants = make_tenants(num_tenants, arrival_rate)
         self.tenant_colors = {t.tenant_id: t.color for t in self.tenants}
         self._populate_tenant_rows()
         self._apply_queue_tenant_tags()
@@ -277,7 +340,7 @@ class Dashboard(tk.Tk):
         config = self._read_experiment_config()
         if config is None:
             return
-        capacity, num_tenants, counts, seed = config
+        capacity, seed = config["capacity"], config["seed"]
 
         name = self.scheduler_var.get()
         if name not in self.schedulers:
@@ -286,9 +349,11 @@ class Dashboard(tk.Tk):
         scheduler = self.schedulers[name]()
 
         # Rebuild tenants for this run, then pre-generate the finite job trace.
-        # Same (num_tenants, counts, seed) => identical trace every run.
-        self._apply_tenant_config(num_tenants)
-        jobs = generate_trace(self.tenants, counts, seed)
+        # Same (num_tenants, counts, arrival_rate, seed) => identical trace
+        # every run.
+        self._apply_tenant_config(config["num_tenants"], config["arrival_rate"])
+        jobs = generate_trace(self.tenants, config["counts"], seed,
+                              arrival_rate=config["arrival_rate"])
 
         self._user_stopped = False
         # Drop the previous run's artifacts so a run that finishes without any
@@ -314,6 +379,8 @@ class Dashboard(tk.Tk):
         self.worker = threading.Thread(
             target=simulation_thread_main,
             args=(self.event_q, self.stop_flag, capacity, self.tenants, jobs, scheduler),
+            kwargs={"threshold_pct": config["threshold_pct"],
+                    "safety_margin_mb": config["safety_margin_mb"]},
             daemon=True,
         )
         self.worker.start()
@@ -478,7 +545,8 @@ class Dashboard(tk.Tk):
                 wt = WORKLOAD_TYPES.get(j.get("wtype"))
                 gpu_types[j["gpu"]] = wt.label if wt else "?"
         self._draw_grid(snap["capacity"], snap["gpu_owner"], gpu_types,
-                        snap.get("server_queue"))
+                        snap.get("server_queue"), snap.get("partitions"))
+        self._render_admission(snap.get("admission"))
         for tenant_id, s in snap["tenant_stats"].items():
             if tenant_id in self.tenant_vars:
                 self.tenant_vars[tenant_id].set(
@@ -510,21 +578,64 @@ class Dashboard(tk.Tk):
                 tags=("completed",) if done else (j["tenant"],),
             )
 
-    def _draw_grid(self, capacity, gpu_owner, gpu_types=None, server_queue=None):
+    def _render_admission(self, adm):
+        """Update the admission-control panel from a snapshot's `admission`
+        block: the outcome counters line, plus a merged, time-ordered feed of
+        recent decisions and throttle raise/release events."""
+        if not adm:
+            return
+        c = adm.get("counters", {})
+        throttled = adm.get("throttled_partitions", [])
+        self.admission_counters_var.set(
+            f"decisions: {adm.get('decisions', 0)}   admit: {c.get('admit', 0)}   "
+            f"queue: {c.get('queue', 0)}   reject: {c.get('reject', 0)}   "
+            f"throttle: {c.get('throttle_running', 0)}   "
+            f"throttled now: {', '.join(f'P{i}' for i in throttled) or '—'}")
+
+        events = []
+        for r in adm.get("recent", []):
+            events.append((r["timestamp"], (
+                f"[{r['timestamp']:7.2f}s] job {r['job_id']:>3} "
+                f"({r['tenant']}, {r['mem_mb']} MB) -> P{r['partition']}: "
+                f"{r['outcome'].upper()}  "
+                f"({r['projected_mb']}+{r['margin_mb']} vs {r['limit_mb']:.0f} MB)")))
+        for r in adm.get("recent_throttle", []):
+            who = f" (job {r['job_id']})" if r.get("job_id") is not None else ""
+            events.append((r["timestamp"],
+                           f"[{r['timestamp']:7.2f}s] P{r['partition']} "
+                           f"throttle {r['event']}{who}"))
+        events.sort(key=lambda e: e[0])
+        self.admission_list.delete(0, tk.END)
+        for _, line in events[-12:]:
+            self.admission_list.insert(tk.END, line)
+        self.admission_list.see(tk.END)
+
+    def _draw_grid(self, capacity, gpu_owner, gpu_types=None, server_queue=None,
+                   partitions=None):
         gpu_types = gpu_types or {}
         server_queue = server_queue or []
+        partitions = partitions or []
         self.grid_canvas.delete("all")
         pad = 6
+        # Extra vertical room under each box for the partition-usage bar and
+        # its used/cap MB caption.
+        foot = 18
+        pitch = self.BOX + pad + foot
         for gpu_id in range(capacity):
             col = gpu_id % self.GRID_COLS
             row = gpu_id // self.GRID_COLS
             x0 = pad + col * (self.BOX + pad)
-            y0 = pad + row * (self.BOX + pad)
+            y0 = pad + row * pitch
             x1, y1 = x0 + self.BOX, y0 + self.BOX
             tenant_id = gpu_owner.get(gpu_id)
             color = self.tenant_colors.get(tenant_id, "#e0e0e0")  # gray = idle
             fg = "white" if tenant_id else "black"
-            self.grid_canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#999999")
+            part = partitions[gpu_id] if gpu_id < len(partitions) else None
+            # Orange border marks a partition running cooperatively throttled.
+            outline, width = (("#ff8f00", 2) if part and part.get("throttled")
+                              else ("#999999", 1))
+            self.grid_canvas.create_rectangle(x0, y0, x1, y1, fill=color,
+                                              outline=outline, width=width)
             # GPU id near the top, workload-type letter (L/M/H) below it.
             self.grid_canvas.create_text((x0 + x1) / 2, y0 + self.BOX * 0.33,
                                          text=str(gpu_id), fill=fg)
@@ -540,8 +651,29 @@ class Dashboard(tk.Tk):
             if waiting > 0:
                 self.grid_canvas.create_text(x1 - 8, y0 + 8, text=f"+{waiting}",
                                              fill=fg, font=("TkDefaultFont", 8, "bold"))
+            # Partition VRAM usage bar (ledger used / cap MB): green while
+            # under the admission threshold, red once past it.
+            if part:
+                cap = part.get("cap_mb") or 0
+                used = part.get("used_mb", 0)
+                frac = min(used / cap, 1.0) if cap else 0.0
+                try:
+                    limit_frac = float(self.threshold_var.get()) / 100.0
+                except (tk.TclError, ValueError):
+                    limit_frac = 1.0
+                by0, by1 = y1 + 3, y1 + 8
+                self.grid_canvas.create_rectangle(x0, by0, x1, by1,
+                                                  fill="#eeeeee", outline="#bbbbbb")
+                if frac > 0:
+                    fill = "#e53935" if frac > limit_frac else "#43a047"
+                    self.grid_canvas.create_rectangle(
+                        x0, by0, x0 + self.BOX * frac, by1, fill=fill, outline="")
+                self.grid_canvas.create_text((x0 + x1) / 2, by1 + 5,
+                                             text=f"{used}/{cap}",
+                                             font=("TkDefaultFont", 7),
+                                             fill="#555555")
         rows_needed = (capacity + self.GRID_COLS - 1) // self.GRID_COLS
-        self.grid_canvas.configure(height=max(80, rows_needed * (self.BOX + pad) + pad))
+        self.grid_canvas.configure(height=max(80, rows_needed * pitch + pad))
 
 
     def _ensure_gpu_panel(self, index, name):

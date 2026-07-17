@@ -261,14 +261,19 @@ class AdmissionController:
                 })
 
     # ---- introspection for snapshots / UI ---------------------------------------
-    def snapshot(self):
-        """Plain-dict view for the engine's state snapshots: outcome counters
-        plus the number of partitions currently admission-throttled."""
+    def snapshot(self, recent=12):
+        """Plain-dict view for the engine's state snapshots: outcome counters,
+        the partitions currently admission-throttled, and the `recent` most
+        recent decision / throttle-event rows (copies), so the UI can render a
+        live "scheduling decisions / throttling events" feed without touching
+        the full log mid-run."""
         with self._lock:
             return {
                 "counters": dict(self.counters),
                 "decisions": len(self.log),
                 "throttled_partitions": sorted(self._throttled),
+                "recent": [dict(r) for r in self.log[-recent:]],
+                "recent_throttle": [dict(r) for r in self.throttle_log[-recent:]],
             }
 
 
