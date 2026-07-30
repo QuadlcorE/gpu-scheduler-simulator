@@ -154,18 +154,6 @@ throttled flag, OOM flag), `admission_log.csv`, `telemetry.csv`, `summary.csv`.
    (used/cap MB) to the grid; add counters / log view for admission decisions and
    throttle events.
 
-## Phase 9 — Cleanup, tests, docs
-
-1. Move `multitenant.py` and `boilerplate.py` to a `legacy/` folder (they'd otherwise
-   confuse a marker reading the repo — and they're the only current SimPy usage, which
-   becomes misleading once Phase 5 lands).
-2. Tests: unit tests for the four-step admission decision (admit/queue/reject
-   boundaries, safety margin math), priority ordering (higher priority jumps the
-   queue), fair-share anti-starvation, and extend `test_replicability.py` to cover the
-   new seeded fields (`mem_mb`, `priority`).
-3. Update `architecture.md` and `requirements.txt` (simpy stays, add nothing else —
-   pynvml/torch/psutil already cover it).
-
 ## Suggested order and why
 
 Phases 1→2→3 are the dependency spine (jobs need demands before partitions can cap

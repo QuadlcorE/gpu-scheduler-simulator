@@ -7,8 +7,8 @@ import threading
 from GPUMonitoring.monitoring import GPU_COUNT, feed_hardware, GPU_AVAILABLE
 from simulation.simulator import SimEvent, simulation_thread_main
 from simulation.results import export_run
-from Workload.workload import (DEFAULT_ARRIVAL_RATE, WORKLOAD_TYPES,
-                               make_tenants, generate_trace)
+from Workload.workload import (DEFAULT_ARRIVAL_RATE, DEFAULT_ITER_MULTIPLIER,
+                               WORKLOAD_TYPES, make_tenants, generate_trace)
 from Scheduling_control.loader import load_schedulers
 
 class Dashboard(tk.Tk):
@@ -18,7 +18,9 @@ class Dashboard(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SimPy Simulation + Hardware Monitor")
-        self.geometry("1280x720")
+        # Wide enough for the Configuration + Hardware columns to sit side by
+        # side (config needs ~800px, Hardware ~510px) without clipping.
+        self.geometry("1440x820")
 
         self.event_q = None
         self.stop_flag = None
@@ -44,6 +46,14 @@ class Dashboard(tk.Tk):
         # instance is created per run (some are stateful).
         self.schedulers = load_schedulers()
 
+        # Everything lives inside a scrollable container so the full UI is
+        # reachable even when it's taller than the window (each panel is packed
+        # into self.content instead of directly into the root).
+        self._build_scrollable_container()
+        # Two-column top band: config / GPU grid / job flow stack on the left,
+        # Hardware sits beside them on the right.
+        self._build_columns()
+
         self._build_config_panel()
 
         # Tenants that generate the simulated workload, plus a color lookup used
@@ -53,17 +63,70 @@ class Dashboard(tk.Tk):
         self.tenant_colors = {t.tenant_id: t.color for t in self.tenants}
 
         self._build_gpu_grid_panel()
+        self._build_flow_panel()
+        self._build_hw_panel()  # right column, beside config / grid / flow
+        # Wider panels pack full-width below the two-column band.
         self._build_admission_panel()
         self._build_queue_panel()
         self._build_tenant_panel()
-        self._build_hw_panel()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll_hardware)
 
 
+    def _build_scrollable_container(self):
+        """Host all panels inside a scrollable Canvas so the whole UI stays
+        reachable when it's taller than the window. Panels pack into
+        self.content (the inner frame) rather than the root window."""
+        outer = ttk.Frame(self)
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self.content = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=self.content, anchor="nw")
+
+        # Keep the scrollregion in sync with the content's real size, and stretch
+        # the inner frame to the canvas width so horizontal fill/pack still works.
+        self.content.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(window, width=e.width))
+
+        # Mouse-wheel scrolling while the pointer is over the canvas area.
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _bind_wheel(_):
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        def _unbind_wheel(_):
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        self._scroll_canvas = canvas
+
+    def _build_columns(self):
+        """Split the top of the UI into two columns. The left column stacks the
+        Configuration, GPU Grid and Job Flow panels; the right column holds the
+        Hardware panel beside them. The wider panels (Admission, Job Queue,
+        Tenants) pack full-width into self.content below this band."""
+        top = ttk.Frame(self.content)
+        top.pack(fill="x")
+        self.left_col = ttk.Frame(top)
+        self.left_col.pack(side="left", fill="both", expand=True)
+        self.right_col = ttk.Frame(top)
+        self.right_col.pack(side="left", fill="y", anchor="n")
+
     def _build_config_panel(self):
-        frame = ttk.LabelFrame(self, text="Configuration")
+        frame = ttk.LabelFrame(self.left_col, text="Configuration")
         frame.pack(fill=tk.X, padx=10, pady=10)
 
         # --- row 1: hardware + scheduler + run controls ---
@@ -122,7 +185,16 @@ class Dashboard(tk.Tk):
         self.seed_var = tk.IntVar(value=0)
         self.seed_spinbox = ttk.Spinbox(row2, from_=0, to=999999, width=8,
                                         textvariable=self.seed_var)
-        self.seed_spinbox.pack(side="left", padx=(0, 5))
+        self.seed_spinbox.pack(side="left", padx=(0, 10))
+
+        # Whole-experiment compute-intensity scale: every job runs this many
+        # times its drawn matmul iterations (e.g. 1000 => 1000x the iterations).
+        # Scales wall-clock work linearly without touching memory or arrivals.
+        ttk.Label(row2, text="Iterations x:").pack(side="left", padx=(5, 2))
+        self.iter_mult_var = tk.IntVar(value=DEFAULT_ITER_MULTIPLIER)
+        self.iter_mult_spinbox = ttk.Spinbox(row2, from_=1, to=100000, increment=1,
+                                             width=8, textvariable=self.iter_mult_var)
+        self.iter_mult_spinbox.pack(side="left", padx=(0, 5))
 
         # --- row 3: §3.8 knobs -- arrival intensity + admission control ---
         row3 = ttk.Frame(frame)
@@ -165,17 +237,203 @@ class Dashboard(tk.Tk):
         self.status_var.set(f"Loaded {len(self.schedulers)} scheduler(s) from schedulers/")
 
     def _build_gpu_grid_panel(self):
-        frame = ttk.LabelFrame(self, text="GPU Grid")
+        frame = ttk.LabelFrame(self.left_col, text="GPU Grid")
         frame.pack(fill="x", padx=10, pady=(0, 10))
         self.sim_time_var = tk.StringVar(value="t = 0.00")
         ttk.Label(frame, textvariable=self.sim_time_var).pack(anchor="w")
         self.grid_canvas = tk.Canvas(frame, height=120, bg="white")
         self.grid_canvas.pack(fill="x", padx=5, pady=5)
 
+    def _build_flow_panel(self):
+        """Live job-flow view: jobs arrive into the global queue on the left and
+        fan out to the per-GPU server lanes on the right, so distribution across
+        GPUs is visible as it happens. Driven entirely by the same snapshot the
+        poll loop already delivers -- no extra engine data or threading."""
+        frame = ttk.LabelFrame(
+            self.left_col,
+            text="Job Flow  (arrivals -> global queue -> GPU distribution)")
+        frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.flow_canvas = tk.Canvas(frame, height=140, bg="white",
+                                     highlightthickness=0)
+        self.flow_canvas.pack(fill="x", padx=5, pady=5)
+        # Job-flow animation state. `_flow_prev` maps job_id -> the GPU it was
+        # placed on last frame (None if unplaced), so the next frame can detect
+        # a fresh assignment and glide a token along the connector. `_flow_seq`
+        # hands out a unique canvas tag per in-flight animation.
+        self._flow_prev = {}
+        self._flow_seq = 0
+
+    # px geometry for the flow panel
+    FLOW_TOK_W = 34
+    FLOW_TOK_H = 22
+
+    def _draw_flow_token(self, c, x, y, job, running=False, tags="static"):
+        """Draw one job as a tenant-colored box stamped with its id + workload
+        letter (L/M/H), matching the grid's color/letter scheme. The running job
+        gets a bold dark outline so it stands out from the queued ones behind it."""
+        w, h = self.FLOW_TOK_W, self.FLOW_TOK_H
+        tenant = job.get("tenant")
+        color = self.tenant_colors.get(tenant, "#e0e0e0")
+        wt = WORKLOAD_TYPES.get(job.get("wtype"))
+        letter = wt.label if wt else "?"
+        outline, width = ("#333333", 2) if running else ("#aaaaaa", 1)
+        c.create_rectangle(x, y, x + w, y + h, fill=color, outline=outline,
+                           width=width, tags=tags)
+        c.create_text(x + w / 2, y + h / 2, text=f"{job['job_id']}{letter}",
+                      fill="white" if tenant else "black",
+                      font=("TkDefaultFont", 8, "bold"), tags=tags)
+
+    def _draw_flow(self, snap):
+        """Render the job-flow panel from a snapshot: queued jobs stacked in the
+        global-queue column, and each GPU's lane showing its running job plus the
+        jobs waiting in that server's queue behind it (FIFO order). Arrows fan
+        from the queue to the lanes, and a token is animated along the arrow
+        whenever a job is newly assigned to a GPU.
+
+        Only the "static" layer is redrawn each snapshot; in-flight assignment
+        animations carry the "anim" tag and are left untouched, so a redraw
+        landing mid-glide doesn't erase them."""
+        c = self.flow_canvas
+        c.delete("static")
+        capacity = snap["capacity"]
+        jobs = snap.get("jobs", [])
+
+        queued = sorted((j for j in jobs if j.get("state") == "queued"),
+                        key=lambda j: j["job_id"])
+        running = {j["gpu"]: j for j in jobs
+                   if j.get("state") == "running" and j.get("gpu") is not None}
+        # Jobs waiting in each server's queue, ordered by when they were assigned
+        # there (true FIFO order behind the running job).
+        queued_by_gpu = {i: [] for i in range(capacity)}
+        for j in jobs:
+            g = j.get("gpu")
+            if j.get("state") == "server-queue" and g is not None and 0 <= g < capacity:
+                queued_by_gpu[g].append(j)
+        for waiting in queued_by_gpu.values():
+            waiting.sort(key=lambda j: (j.get("assign_time") or 0.0, j["job_id"]))
+
+        pad = 10
+        tok_w, tok_h = self.FLOW_TOK_W, self.FLOW_TOK_H
+        top = pad + 14
+        qx = pad
+        max_show = 4
+        lane_x = qx + tok_w + 100
+        lane_w = 340
+        lane_h = tok_h + 8
+        src_x = qx + tok_w + 6
+        src_y = top + tok_h / 2
+
+        # Detect jobs assigned to a GPU since the last frame and glide a token
+        # from the queue along the connector to the target lane. `_flow_prev`
+        # holds None for a job that was still unplaced, so an int-now / None-before
+        # transition is exactly a fresh placement.
+        new_prev = {}
+        for j in jobs:
+            on_gpu = (j["gpu"] if j.get("state") in ("server-queue", "running")
+                      and j.get("gpu") is not None else None)
+            jid = j["job_id"]
+            new_prev[jid] = on_gpu
+            if (on_gpu is not None and 0 <= on_gpu < capacity
+                    and self._flow_prev.get(jid) is None):
+                self._start_flow_anim(j, (src_x, src_y),
+                                      (lane_x + 4, top + on_gpu * lane_h))
+        self._flow_prev = new_prev
+
+        c.create_text(qx, pad - 2, text="GLOBAL QUEUE", anchor="nw",
+                      font=("TkDefaultFont", 8, "bold"), fill="#333333",
+                      tags="static")
+        if queued:
+            for k, j in enumerate(queued[:max_show]):
+                self._draw_flow_token(c, qx, top + k * (tok_h + 4), j)
+            if len(queued) > max_show:
+                c.create_text(qx, top + max_show * (tok_h + 4),
+                              text=f"+{len(queued) - max_show} more", anchor="nw",
+                              font=("TkDefaultFont", 8), fill="#777777",
+                              tags="static")
+        else:
+            c.create_text(qx, top, text="(empty)", anchor="nw",
+                          font=("TkDefaultFont", 8), fill="#aaaaaa", tags="static")
+
+        # Lanes: one per GPU, stacked on the right. Each shows the running job
+        # (bold outline) then the jobs waiting in that server's queue.
+        for gpu_id in range(capacity):
+            ly = top + gpu_id * lane_h
+            mid = ly + tok_h / 2
+            c.create_line(src_x, src_y, lane_x - 4, mid, fill="#d0d0d0",
+                          arrow="last", tags="static")
+            c.create_rectangle(lane_x, ly, lane_x + lane_w, ly + tok_h,
+                               fill="#f7f7f7", outline="#dddddd", tags="static")
+            c.create_text(lane_x - 8, mid, text=f"GPU {gpu_id}", anchor="e",
+                          font=("TkDefaultFont", 8, "bold"), tags="static")
+            run = running.get(gpu_id)
+            waiting = queued_by_gpu[gpu_id]
+            x = lane_x + 4
+            if run:
+                self._draw_flow_token(c, x, ly, run, running=True)
+                x += tok_w + 12
+            elif not waiting:
+                c.create_text(x + 4, mid, text="idle", anchor="w",
+                              font=("TkDefaultFont", 8), fill="#bbbbbb",
+                              tags="static")
+            shown = 0
+            for wj in waiting:
+                if x + tok_w > lane_x + lane_w - 26:
+                    break
+                self._draw_flow_token(c, x, ly, wj, running=False)
+                x += tok_w + 3
+                shown += 1
+            if shown < len(waiting):
+                c.create_text(lane_x + lane_w - 4, mid,
+                              text=f"+{len(waiting) - shown}", anchor="e",
+                              font=("TkDefaultFont", 8, "bold"), fill="#ff8f00",
+                              tags="static")
+
+        # Keep any gliding assignment tokens above the freshly drawn static layer.
+        c.tag_raise("anim")
+        rows = max(capacity, max_show + 1)
+        c.configure(height=max(120, top + rows * lane_h + pad))
+
+    def _start_flow_anim(self, job, src, dst, steps=12):
+        """Create a token at `src` and glide it to `dst` over `steps` frames to
+        visualize a job being assigned to a GPU. The token carries the "anim"
+        tag (so snapshot redraws leave it alone) plus a unique per-animation tag
+        used to move and finally delete it."""
+        c = self.flow_canvas
+        self._flow_seq += 1
+        tag = f"anim{self._flow_seq}"
+        x0, y0 = src
+        w, h = self.FLOW_TOK_W, self.FLOW_TOK_H
+        tenant = job.get("tenant")
+        color = self.tenant_colors.get(tenant, "#e0e0e0")
+        wt = WORKLOAD_TYPES.get(job.get("wtype"))
+        letter = wt.label if wt else "?"
+        # Orange outline marks the token as in-transit (being placed).
+        c.create_rectangle(x0, y0, x0 + w, y0 + h, fill=color, outline="#ff8f00",
+                           width=2, tags=("anim", tag))
+        c.create_text(x0 + w / 2, y0 + h / 2, text=f"{job['job_id']}{letter}",
+                      fill="white" if tenant else "black",
+                      font=("TkDefaultFont", 8, "bold"), tags=("anim", tag))
+        dx = (dst[0] - x0) / steps
+        dy = (dst[1] - y0) / steps
+        self._step_flow_anim(tag, dx, dy, steps)
+
+    def _step_flow_anim(self, tag, dx, dy, remaining):
+        """Advance one in-flight assignment animation by a single frame, or
+        remove its token once it reaches the lane."""
+        c = self.flow_canvas
+        try:
+            if remaining <= 0:
+                c.delete(tag)
+                return
+            c.move(tag, dx, dy)
+        except tk.TclError:
+            return  # canvas gone (window closing) -- stop quietly
+        self.after(30, lambda: self._step_flow_anim(tag, dx, dy, remaining - 1))
+
     def _build_admission_panel(self):
         """Live admission-control view: outcome counters plus a rolling feed
         of the most recent scheduling decisions and throttle events."""
-        frame = ttk.LabelFrame(self, text="Admission control  (scheduling decisions / throttling events)")
+        frame = ttk.LabelFrame(self.content, text="Admission control  (scheduling decisions / throttling events)")
         frame.pack(fill="x", padx=10, pady=(0, 10))
         self.admission_counters_var = tk.StringVar(
             value="decisions: 0   admit: 0   queue: 0   reject: 0   throttle: 0   throttled now: —")
@@ -186,7 +444,7 @@ class Dashboard(tk.Tk):
         self.admission_list.pack(fill="x", padx=5, pady=(2, 4))
 
     def _build_queue_panel(self):
-        frame = ttk.LabelFrame(self, text="Job Queue  (generated jobs and their assigned GPU)")
+        frame = ttk.LabelFrame(self.content, text="Job Queue  (generated jobs and their assigned GPU)")
         frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         cols = ("job", "tenant", "type", "size", "iters", "state", "gpu",
@@ -220,7 +478,7 @@ class Dashboard(tk.Tk):
             "completed", background="#f0f0f0", foreground="#a0a0a0")
 
     def _build_tenant_panel(self):
-        frame = ttk.LabelFrame(self, text="Tenants")
+        frame = ttk.LabelFrame(self.content, text="Tenants")
         frame.pack(fill="x", padx=10, pady=(0, 10))
         self.tenant_frame = frame
         self.tenant_vars = {}
@@ -249,7 +507,7 @@ class Dashboard(tk.Tk):
             self.tenant_wait_vars[tenant.tenant_id] = wvar
 
     def _build_hw_panel(self):
-        frame = ttk.LabelFrame(self, text="Hardware")
+        frame = ttk.LabelFrame(self.right_col, text="Hardware")
         frame.pack(fill="x", padx=10, pady=10)
         self.hardware_frame = frame
         self.bars = {}
@@ -277,6 +535,7 @@ class Dashboard(tk.Tk):
         for sb in self.count_spinboxes:
             sb.config(state=state)
         self.seed_spinbox.config(state=state)
+        self.iter_mult_spinbox.config(state=state)
         self.arrival_spinbox.config(state=state)
         self.threshold_spinbox.config(state=state)
         self.margin_spinbox.config(state=state)
@@ -294,12 +553,13 @@ class Dashboard(tk.Tk):
             num_tenants = int(self.num_tenants_var.get())
             counts = {name: int(var.get()) for name, var in self.count_vars.items()}
             seed = int(self.seed_var.get())
+            iter_multiplier = int(self.iter_mult_var.get())
             arrival_rate = float(self.arrival_rate_var.get())
             threshold_pct = float(self.threshold_var.get())
             safety_margin_mb = int(self.margin_var.get())
         except (tk.TclError, ValueError):
             self.status_var.set("Enter valid numbers for partitions, tenants, counts, "
-                                "seed, arrival rate, threshold, and margin")
+                                "seed, iterations x, arrival rate, threshold, and margin")
             return None
         if capacity < 1:
             self.status_var.set("Partition count must be at least 1")
@@ -309,6 +569,9 @@ class Dashboard(tk.Tk):
             return None
         if sum(counts.values()) < 1:
             self.status_var.set("Set at least one job per tenant (light/medium/heavy)")
+            return None
+        if iter_multiplier < 1:
+            self.status_var.set("Iterations x must be at least 1")
             return None
         if arrival_rate <= 0:
             self.status_var.set("Arrival rate must be greater than 0")
@@ -324,6 +587,7 @@ class Dashboard(tk.Tk):
             "num_tenants": num_tenants,
             "counts": counts,
             "seed": seed,
+            "iter_multiplier": iter_multiplier,
             "arrival_rate": arrival_rate,
             "threshold_pct": threshold_pct,
             "safety_margin_mb": safety_margin_mb,
@@ -353,7 +617,8 @@ class Dashboard(tk.Tk):
         # every run.
         self._apply_tenant_config(config["num_tenants"], config["arrival_rate"])
         jobs = generate_trace(self.tenants, config["counts"], seed,
-                              arrival_rate=config["arrival_rate"])
+                              arrival_rate=config["arrival_rate"],
+                              iter_multiplier=config["iter_multiplier"])
 
         self._user_stopped = False
         # Drop the previous run's artifacts so a run that finishes without any
@@ -373,6 +638,10 @@ class Dashboard(tk.Tk):
         )
         # Reset the queue table so a previous run's rows don't linger.
         self.queue_tree.delete(*self.queue_tree.get_children())
+        # Reset the flow panel: clear any in-flight assignment animations and
+        # forget last run's placements so this run's first assignments animate.
+        self.flow_canvas.delete("anim")
+        self._flow_prev = {}
 
         self.event_q = queue.Queue()
         self.stop_flag = threading.Event()
@@ -546,6 +815,7 @@ class Dashboard(tk.Tk):
                 gpu_types[j["gpu"]] = wt.label if wt else "?"
         self._draw_grid(snap["capacity"], snap["gpu_owner"], gpu_types,
                         snap.get("server_queue"), snap.get("partitions"))
+        self._draw_flow(snap)
         self._render_admission(snap.get("admission"))
         for tenant_id, s in snap["tenant_stats"].items():
             if tenant_id in self.tenant_vars:

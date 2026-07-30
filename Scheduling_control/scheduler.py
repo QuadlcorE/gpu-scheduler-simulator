@@ -114,6 +114,64 @@ def first_fit(job, partitions):
     return max(partitions, key=admit_headroom)["index"]
 
 
+class ServerSpread:
+    """Even-placement helper for single-queue schedulers.
+
+    A single global queue can feed any server, so left to a plain first-fit the
+    low-index GPUs fill first and the rest sit idle under light load. This
+    helper instead fills servers that have **not been used yet this run** before
+    reusing any, so a burst of jobs fans out across every GPU (GPU 0, GPU 1, …)
+    rather than piling onto GPU 0. Once every server has been used (or the idle
+    ones can't admit the job) it falls back to least-loaded-first placement, so
+    it keeps spreading instead of reverting to index bias.
+
+    Hold one instance per scheduler; a fresh scheduler is built each run, so the
+    "used" history is naturally run-scoped. Feed it committed placements from the
+    scheduler's ``job_placed`` hook via :meth:`note_placed`, and ask it for a
+    partition index with :meth:`place` (queue-on-busy schedulers) or
+    :meth:`place_free` (schedulers that hold the job when all servers are busy).
+    """
+
+    def __init__(self):
+        self._used = set()  # indices of servers a job has been committed to
+
+    def note_placed(self, partition_index):
+        """Record that a job was committed to ``partition_index`` (call from the
+        scheduler's ``job_placed`` hook), marking that server as used."""
+        self._used.add(partition_index)
+
+    def place(self, job, partitions):
+        """Index of the partition to propose for ``job``, spreading load.
+
+        Prefers an idle server not yet used this run that can admit the job
+        (lowest index first -- i.e. round-robin fill across the fresh GPUs).
+        Failing that, spreads by least current load, then most admission
+        headroom. Like :func:`first_fit` it never returns None: when nothing
+        currently fits it proposes the roomiest partition so the admission
+        controller still rules on it (QUEUE to retry, or REJECT a demand that
+        can never fit)."""
+        unused_fit = [p for p in partitions
+                      if p["free"] and p["index"] not in self._used
+                      and job.mem_mb <= admit_headroom(p)]
+        if unused_fit:
+            return min(unused_fit, key=lambda p: p["index"])["index"]
+        fitting = [p for p in partitions if job.mem_mb <= admit_headroom(p)]
+        pool = fitting or partitions
+        return min(pool, key=lambda p: (p["queue_len"], -admit_headroom(p),
+                                        p["index"]))["index"]
+
+    def place_free(self, partitions):
+        """Index of an idle server, preferring never-used ones (lowest index
+        first), or None when every server is busy -- for schedulers that hold a
+        job in the global queue rather than queuing it on a busy server."""
+        free = [p for p in partitions if p["free"]]
+        if not free:
+            return None
+        unused = [p for p in free if p["index"] not in self._used]
+        pool = unused or free
+        return min(pool, key=lambda p: p["index"])["index"]
+
+
 class Scheduler:
     """Base class -- subclass and implement select (or legacy select_server).
 

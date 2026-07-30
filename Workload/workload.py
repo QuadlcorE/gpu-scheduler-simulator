@@ -39,9 +39,9 @@ class WorkloadType:
     mem_range_mb: tuple  # (min, max) declared VRAM demand in MB, inclusive
 
 
-LIGHT = WorkloadType("light", "L", 128, 1, (10, 30), (100, 250))
-MEDIUM = WorkloadType("medium", "M", 384, 2, (10, 30), (400, 700))
-HEAVY = WorkloadType("heavy", "H", 768, 4, (5, 15), (900, 1400))
+LIGHT = WorkloadType("light", "L", 128, 1, (100, 200), (100, 250))
+MEDIUM = WorkloadType("medium", "M", 384, 2, (300, 450), (400, 700))
+HEAVY = WorkloadType("heavy", "H", 768, 4, (600, 800), (900, 1400))
 
 # Lookup by name; also the canonical light->medium->heavy ordering.
 WORKLOAD_TYPES = {w.name: w for w in (LIGHT, MEDIUM, HEAVY)}
@@ -51,6 +51,14 @@ WORKLOAD_TYPES = {w.name: w for w in (LIGHT, MEDIUM, HEAVY)}
 # values first. The range is deliberately small so ties are common and the
 # arrival-order tiebreak stays visible in results.
 PRIORITY_RANGE = (0, 9)
+
+# Global scale applied to every job's drawn iteration count (a whole-experiment
+# compute-intensity knob, §3.8 i). 1 = the workload-type ranges as-is; N makes
+# every job run N x its matmul iterations, so wall-clock work scales linearly
+# without touching memory demand, arrival timing, or the seeded RNG stream (the
+# multiplier is applied *after* the draw, so the same seed yields the same base
+# counts at any multiplier -- runs stay comparable across settings).
+DEFAULT_ITER_MULTIPLIER = 1
 
 # How long one throttled iteration sleeps before doing its matmul. This is the
 # cooperative compute-share/throttle knob: a throttled job still finishes, it
@@ -124,11 +132,17 @@ class Job:
             oom = True
         wall_s = time.perf_counter() - t0
 
-        if oom:
-            # Release whatever partially allocated so the device recovers.
-            ballast = a = b = None
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+        # Release this job's tensors and hand the freed VRAM back to the driver
+        # regardless of outcome (not just on OOM). PyTorch's caching allocator
+        # otherwise keeps the freed blocks in its own pool, so NVML keeps
+        # reporting them as in use -- and the admission controller's live NVML
+        # cross-check would then watch "free" VRAM shrink monotonically across
+        # jobs until every placement is QUEUEd forever and the run stalls with
+        # memory apparently used up. (The reservation ledger self-heals on
+        # release; it's the raw NVML reading that needs the cache flushed.)
+        ballast = a = b = None
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # A cheap flop estimate: each batched NxN @ NxN matmul is ~2*batch*N^3.
         flops = 2 * self.batch * (self.size ** 3) * self.iters
@@ -151,7 +165,8 @@ class Tenant:
         self.arrival_rate = arrival_rate      # mean jobs per real second
         self.color = color
 
-    def make_job(self, job_id, arrival_time, wtype, rng):
+    def make_job(self, job_id, arrival_time, wtype, rng,
+                 iter_multiplier=DEFAULT_ITER_MULTIPLIER):
         """Create one matmul workload for this tenant.
 
         `wtype` selects the workload type (a WorkloadType or its name); the
@@ -159,14 +174,19 @@ class Tenant:
         and declared VRAM demand are drawn from. The job's priority is drawn
         uniformly from PRIORITY_RANGE. `rng` is a dedicated ``random.Random``
         instance so that a run is reproducible from its seed -- the global RNG
-        is never used here."""
+        is never used here.
+
+        `iter_multiplier` scales the drawn iteration count (compute-intensity
+        knob, §3.8 i). It is applied *after* the RNG draw, so it never perturbs
+        the seeded stream -- the same seed yields the same base counts at any
+        multiplier, just scaled."""
         if isinstance(wtype, str):
             wtype = WORKLOAD_TYPES[wtype]
         return Job(
             job_id=job_id,
             tenant_id=self.tenant_id,
             size=wtype.size,
-            iters=rng.randint(*wtype.iter_range),
+            iters=rng.randint(*wtype.iter_range) * iter_multiplier,
             wtype=wtype.name,
             batch=wtype.batch,
             mem_mb=rng.randint(*wtype.mem_range_mb),
@@ -214,7 +234,8 @@ def make_tenants(num_tenants, arrival_rate=DEFAULT_ARRIVAL_RATE):
     ]
 
 
-def generate_trace(tenants, counts, seed, arrival_rate=None):
+def generate_trace(tenants, counts, seed, arrival_rate=None,
+                   iter_multiplier=DEFAULT_ITER_MULTIPLIER):
     """Return the full, sorted list of jobs for one run.
 
     `counts` is ``{"light": n, "medium": n, "heavy": n}`` -- the number of jobs
@@ -222,11 +243,13 @@ def generate_trace(tenants, counts, seed, arrival_rate=None):
     per second per tenant) is an experiment parameter: when given it overrides
     every tenant's own rate, so arrival intensity is controlled per run rather
     than baked into the tenant objects; when None each tenant's configured rate
-    is used. Every random choice (job ordering, iteration counts, memory
-    demands, priorities, arrival gaps) comes from a single
-    ``random.Random(seed)``, so the trace is fully determined by (tenants,
-    counts, seed, arrival_rate). Jobs are returned sorted by arrival time with
-    ids assigned in arrival order.
+    is used. `iter_multiplier` scales every job's matmul iteration count (see
+    Tenant.make_job) -- a whole-experiment compute-intensity knob applied after
+    the RNG draw, so it leaves the trace otherwise identical. Every random
+    choice (job ordering, iteration counts, memory demands, priorities, arrival
+    gaps) comes from a single ``random.Random(seed)``, so the trace is fully
+    determined by (tenants, counts, seed, arrival_rate, iter_multiplier). Jobs
+    are returned sorted by arrival time with ids assigned in arrival order.
     """
     rng = random.Random(seed)
     jobs = []
@@ -243,7 +266,8 @@ def generate_trace(tenants, counts, seed, arrival_rate=None):
         for wtype in types:
             t += rng.expovariate(rate)
             # job_id is a placeholder here; reassigned in arrival order below.
-            jobs.append(tenant.make_job(0, arrival_time=t, wtype=wtype, rng=rng))
+            jobs.append(tenant.make_job(0, arrival_time=t, wtype=wtype, rng=rng,
+                                        iter_multiplier=iter_multiplier))
 
     jobs.sort(key=lambda j: j.arrival_time)
     for job_id, job in enumerate(jobs):
@@ -251,13 +275,15 @@ def generate_trace(tenants, counts, seed, arrival_rate=None):
     return jobs
 
 
-def build_experiment(num_tenants, counts, seed, arrival_rate=DEFAULT_ARRIVAL_RATE):
+def build_experiment(num_tenants, counts, seed, arrival_rate=DEFAULT_ARRIVAL_RATE,
+                     iter_multiplier=DEFAULT_ITER_MULTIPLIER):
     """Convenience wrapper: build the tenants and their job trace together.
 
-    `arrival_rate` is threaded through both the tenants and the trace, so it
-    is a single, citable config parameter for the whole experiment."""
+    `arrival_rate` and `iter_multiplier` are threaded through to the trace, so
+    each is a single, citable config parameter for the whole experiment."""
     tenants = make_tenants(num_tenants, arrival_rate)
-    jobs = generate_trace(tenants, counts, seed, arrival_rate=arrival_rate)
+    jobs = generate_trace(tenants, counts, seed, arrival_rate=arrival_rate,
+                          iter_multiplier=iter_multiplier)
     return tenants, jobs
 
 

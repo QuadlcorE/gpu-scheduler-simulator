@@ -1,0 +1,130 @@
+REPORT REQUIREMENTS -> CODE TRACEABILITY
+Source: Dissertation Ch.3 (Methodology). Status as of 2026-07-27.
+Status key: [x] met  [~] partial  [ ] missing  [-] out of scope
+Evidence = the module/symbol that satisfies the requirement.
+
+Verified by running: test_admission.py, test_schedulers.py, test_replicability.py
+(all PASSED, including engine integration and cross-scheduler trace equality).
+
+--------------------------------------------------------------------------
+ID     REQUIREMENT                                      SRC      ST  EVIDENCE
+--------------------------------------------------------------------------
+METHODOLOGY (3.1-3.2)
+M1     Discrete-event simulation of scheduling          3.2a     [x] simulation/simulator.py -- simpy.rt.RealtimeEnvironment
+M2     Real GPU telemetry monitoring                    3.2b     [x] GPUMonitoring/monitoring.py
+M3     Controlled experimental workload generation      3.2c     [x] Workload/workload.py generate_trace
+M4     Quantitative policy evaluation                   3.2d     [x] simulation/results.py summarize (all 7 metrics)
+M5     Hybrid: DES modelling + real CUDA execution      3.2      [x] SimPy events + Server threads running Job.run
+M6     Control: workload arrival rate/times             3.2i     [x] ExperimentConfig.arrival_rate -> generate_trace
+M7     Control: memory demand distribution              3.2ii    [x] WorkloadType.mem_range_mb -> Job.mem_mb
+M8     Control: scheduling algorithms                   3.2iii   [x] Scheduling_control/loader.py plugin discovery
+M9     Control: admission control thresholds            3.2iv    [x] ExperimentConfig.threshold_pct / safety_margin_mb
+
+ARCHITECTURE (3.3)
+A1     Scheduling + admission control module            3.3.1    [x] Scheduling_control/ (scheduler.py + admission.py)
+A2     GPU monitoring layer                             3.3.2    [x] GPUMonitoring/monitoring.py
+A3     Workload generation layer                        3.3.3    [x] Workload/workload.py
+A4     UI dashboard layer                               3.3.4    [x] UI/dashboard.py
+A5     Admit / queue / reject decision                  3.3.1    [x] AdmissionController.decide -> ADMIT/QUEUE/REJECT
+A6     VRAM safety-margin check                         3.3.1    [x] AdmissionController.safety_margin_mb (step 3)
+A7     Throttle job when load is heavy                  3.3.1    [x] THROTTLE_RUNNING + Job.run(throttle=...)
+A8     Telemetry: total + used VRAM                     3.3.2i   [x] monitoring.py mem_used_mb / mem_total_mb
+A9     Telemetry: per-process memory usage              3.3.2ii  [x] nvmlDeviceGetComputeRunningProcesses -> proc_mem_mb
+A10    Telemetry: GPU core utilisation %                3.3.2iii [x] monitoring.py gpu_util
+A11    Telemetry: active process IDs                    3.3.2iv  [x] nvmlDeviceGetComputeRunningProcesses -> proc_count
+A12    Fixed-interval polling                           3.3.2    [x] TelemetrySampler, TELEMETRY_INTERVAL_S = 0.25 s
+A13    Workloads via PyTorch CUDA tensor ops            3.3.3    [x] Job.run -- batched torch.matmul
+A14    Workload param: tensor size (mem allocation)     3.3.3i   [x] WorkloadType.size + mem_mb ballast tensor
+A15    Workload param: batch size                       3.3.3ii  [x] WorkloadType.batch -> Job.batch
+A16    Workload param: compute complexity               3.3.3iii [x] WorkloadType.iter_range + iter_multiplier
+A17    Workload param: execution duration               3.3.3iv  [x] Job.iters -> measured metrics["wall_s"]
+A18    Three classes: light / medium / heavy            3.3.3    [x] LIGHT / MEDIUM / HEAVY presets
+A19    UI: current GPU memory usage                     3.3.4i   [x] dashboard hardware panel + per-partition bar
+A20    UI: active jobs per partition                    3.3.4ii  [x] grid: running tenant/type letter + "+N" backlog badge
+A21    UI: queue lengths                                3.3.4iii [x] dashboard queue panel + per-server queue_len
+A22    UI: scheduling decisions                         3.3.4iv  [x] admission panel: counters + rolling decision feed
+A23    UI: throttling events                            3.3.4v   [x] throttle raise/release feed + orange partition border
+A24    UI decoupled from scheduling logic               3.3.4    [x] engine -> event queue -> UI snapshots only
+
+SIMULATION MODEL (3.4)
+S1     Simulated MIG partitions                         3.4.1    [x] simulation/partition.py Partition
+S2     Partition max memory capacity (VRAM cap)         3.4.1i   [x] Partition.vram_cap_mb + reservation ledger
+S3     Partition compute share allocation               3.4.1ii  [x] Partition.compute_share + apply_compute_shares
+S4     Logical (software) isolation, not hardware       3.4.1    [x] policy-enforced ledger; all servers map to cuda:0
+S5     Stochastic arrival model                         3.4.2    [x] rng.expovariate in generate_trace
+S6     Arrival rate parameter                           3.4.2i   [x] arrival_rate threaded through build_experiment
+S7     Memory demand distribution parameter             3.4.2ii  [x] mem_range_mb drawn per job from seeded RNG
+S8     Compute intensity distribution parameter         3.4.2iii [x] iter_range draw x iter_multiplier
+S9     Constraint: total memory capacity limit          3.4.3i   [x] build_partitions: sum(caps) <= physical VRAM
+S10    Constraint: partition-specific memory limits     3.4.3ii  [x] build_partitions: per-cap positivity + enforcement
+S11    Constraint: admission threshold + safety margin  3.4.3iii [x] AdmissionController.limit_mb
+
+SCHEDULING POLICIES (3.5)
+P1     FCFS - arrival order, no prioritisation          3.5.1    [x] schedulers/fcfs.py
+P2     Priority-based - higher priority preempts queue  3.5.2    [x] schedulers/priority.py (queue order only)
+P3     Fair-share - proportional, prevents starvation   3.5.3    [x] schedulers/fair_share.py (GPU-s + VRAM GB-s)
+P4     Per-job priority level attribute                 3.5.2    [x] Job.priority, drawn from PRIORITY_RANGE
+
+ADMISSION CONTROL (3.6)
+C1     Step 1: obtain current VRAM usage                3.6i     [x] partition.used_mb, cross-checked vs NVML free
+C2     Step 2: project VRAM after admitting job         3.6ii    [x] projected = current + job.mem_mb
+C3     Step 3: add safety margin                        3.6iii   [x] needed = projected + safety_margin_mb
+C4     Step 4: compare projection vs partition capacity 3.6iv    [x] needed <= cap_mb * threshold_pct
+C5     Over capacity -> queue the job                   3.6      [x] QUEUE outcome; re-offered next dispatch pass
+C6     Over capacity + already running -> throttle      3.6      [x] THROTTLE_RUNNING (HEAVY_FRACTION test) + reconsider
+C7     Conservative policy avoids runtime OOM           3.6      [x] REJECT unplaceable + NVML cross-check
+                                                                     (test_schedulers: no OOMs on admitted jobs)
+
+IMPLEMENTATION (3.7)
+I1     Python 3.x                                       3.7a     [x] -
+I2     PyTorch                                          3.7b     [x] Job.run
+I3     SimPy (event simulation)                         3.7c     [x] simpy.rt.RealtimeEnvironment (claim now TRUE)
+I4     NVIDIA-ml-py (pynvml)                            3.7d     [x] GPUMonitoring/monitoring.py
+I5     Dear ImGui                                       3.7e     [-] OUT OF SCOPE - code uses Tkinter; amend report
+I6     Single-GPU, 4GB VRAM, Windows 11                 3.7      [x] DEFAULT_TOTAL_VRAM_MB = 4096
+
+EXPERIMENTAL SETUP (3.8)
+E1     Vary workload intensity (L/M/H)                  3.8i     [x] run_experiments.py --mix / --iter-multiplier
+E2     Vary arrival rate                                3.8ii    [x] run_experiments.py --arrival-rates
+E3     Vary number of simulated partitions              3.8iii   [x] run_experiments.py --partitions
+E4     Vary admission threshold percentage              3.8iv    [x] run_experiments.py --thresholds / --margins
+E5     Same workload across schedulers (fair compare)   3.8      [x] trace regenerated per scheduler from same seed
+                                                                     (test_replicability: identical traces confirmed)
+
+EVALUATION METRICS (3.9)
+V1     GPU utilisation percentage                       3.9i     [x] summarize: gpu_util + gpu_util_nvml_mean
+V2     Average VRAM utilisation                         3.9ii    [x] summarize: vram_util_mean (telemetry)
+V3     Job wait time                                    3.9iii   [x] global_wait_s + server_wait_s per tenant
+V4     Job throughput                                   3.9iv    [x] summarize: throughput_jps
+V5     OOM occurrence rate                              3.9v     [x] summarize: oom_rate (caught OOMs + rejects)
+V6     Fairness index (Jain's)                          3.9vi    [x] summarize: fairness_wait / fairness_service
+V7     Partition-level resource stability               3.9vii   [x] summarize: per_partition[i].std_used_mb
+
+STATED LIMITATIONS (3.10) - must remain TRUE of the code
+L1     No SM-level partitioning                         3.10i    [x] hold  compute share is cooperative throttling only
+L2     No kernel-level preemption (queue-order only)    3.10ii   [x] hold  priority reorders the queue, never running jobs
+L3     Python runtime overhead acknowledged             3.10iii  [x] hold
+L4     Single-GPU evaluation                            3.10iv   [x] hold
+L5     Simplified workload modelling                    3.10v    [x] hold  GEMM + ballast tensor, not real training
+
+--------------------------------------------------------------------------
+TALLY   met 72 | partial 0 | missing 0 | limitations holding 5 |
+        out-of-scope 1                                   (total 78)
+--------------------------------------------------------------------------
+
+RUN ARTIFACTS (per experimental condition, written by run_experiments.py):
+  config.json  jobs.csv  admission_log.csv  throttle_log.csv
+  telemetry.csv  summary.csv        + sweep_summary.csv across the grid
+
+REPORT-SIDE EDITS (no code fix possible - the only outstanding work):
+  - 3.3.4 / 3.7e: Dear ImGui -> Tkinter.
+  - 3.7: "RTX-2030" is not a real product; confirm actual model (RTX 2050?).
+  - 3.7: the SimPy claim can stand as written -- the engine now runs on
+    simpy.rt.RealtimeEnvironment.
+
+KNOWN REPO CAVEATS (documentation debt, not requirement gaps):
+  - architecture.md is out of date: it still documents the legacy
+    select_server(job, servers) contract and predates partitions, admission
+    control, the SimPy engine, and the §3.9 metric set.
+  - multitenant.py / boilerplate.py at the repo root are superseded
+    prototypes; their plain simpy.Environment() usage is NOT the real engine.

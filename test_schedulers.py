@@ -99,6 +99,38 @@ def main():
     check("drain order is arrival order", drain(fcfs, jobs, view), [1, 2, 0])
     check("empty queue -> None", fcfs.select([], view), None)
 
+    print("\n[1b] Single-queue spread: fill never-used GPUs before reusing")
+    fcfs = FCFSScheduler()
+    # Three idle, never-used partitions with equal room. Placing three jobs in
+    # turn (committing each via job_placed, as the engine does) should land them
+    # on three DISTINCT GPUs, not pile onto GPU 0.
+    _, i0 = fcfs.select([job(0)], [pview(0), pview(1), pview(2)])
+    fcfs.job_placed(job(0), i0)
+    _, i1 = fcfs.select([job(1)], [pview(0, free=False, queue_len=1),
+                                   pview(1), pview(2)])
+    fcfs.job_placed(job(1), i1)
+    _, i2 = fcfs.select([job(2)], [pview(0, free=False, queue_len=1),
+                                   pview(1, free=False, queue_len=1), pview(2)])
+    fcfs.job_placed(job(2), i2)
+    check("spreads across distinct unused GPUs", sorted([i0, i1, i2]), [0, 1, 2])
+    # Every GPU used now: a fourth job (all busy) goes to the least-loaded one.
+    _, i3 = fcfs.select([job(3)], [pview(0, free=False, queue_len=1),
+                                   pview(1, free=False, queue_len=2),
+                                   pview(2, free=False, queue_len=3)])
+    check("once all used, falls back to least-loaded", i3, 0)
+    # A never-used GPU that can't admit the job is skipped for one that can.
+    fresh = FCFSScheduler()
+    _, i = fresh.select([job(0, mem_mb=100)],
+                        [pview(0, admit=50), pview(1, admit=400)])
+    check("unused-but-full GPU skipped for one that fits", i, 1)
+    # Pooled fills a fresh GPU rather than reusing a busy one.
+    pooled = PooledScheduler()
+    _, pi0 = pooled.select([job(0)], [pview(0), pview(1), pview(2)])
+    pooled.job_placed(job(0), pi0)
+    _, pi1 = pooled.select([job(1)], [pview(0, free=False, queue_len=1),
+                                      pview(1), pview(2)])
+    check("pooled fills a fresh GPU, not the busy one", (pi0, pi1), (0, 1))
+
     print("\n[2] Priority: highest first, ties by arrival")
     prio = PriorityScheduler()
     jobs = [job(0, priority=2, arrival=0.0), job(1, priority=9, arrival=0.1),

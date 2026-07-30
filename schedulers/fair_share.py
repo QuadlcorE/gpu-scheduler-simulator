@@ -25,10 +25,11 @@ drowns out the other). Selection order:
        slot;
     3. then oldest arrival, so within one tenant jobs still run FCFS.
 
-Placement spreads load across partitions: among the partitions that can
-currently admit the job, the least-loaded one (shortest queue, then most
-admission headroom) is proposed, so one tenant's jobs fan out instead of
-piling onto a single slice.
+Placement spreads load across partitions: a never-used GPU is filled first (so
+a tenant's jobs fan out across every slice before any is reused), then among
+the partitions that can currently admit the job the least-loaded one (shortest
+queue, then most admission headroom) is proposed, instead of piling onto a
+single slice.
 
 See Scheduling_control/scheduler.py for the contract.
 """
@@ -36,7 +37,7 @@ See Scheduling_control/scheduler.py for the contract.
 import threading
 from collections import defaultdict
 
-from Scheduling_control.scheduler import Scheduler, admit_headroom
+from Scheduling_control.scheduler import Scheduler, ServerSpread
 
 
 class FairShareScheduler(Scheduler):
@@ -51,9 +52,12 @@ class FairShareScheduler(Scheduler):
         self._gpu_s = defaultdict(float)      # completed GPU-seconds
         self._vram_gb_s = defaultdict(float)  # completed VRAM GB-seconds
         self._inflight = defaultdict(int)     # placed-and-not-finished jobs
+        # Fills never-used GPUs first, then spreads by load (single queue).
+        self._spread = ServerSpread()
 
     # ---- completion feedback ------------------------------------------------
     def job_placed(self, job, partition_index):
+        self._spread.note_placed(partition_index)
         with self._lock:
             self._inflight[job.tenant_id] += 1
 
@@ -81,12 +85,9 @@ class FairShareScheduler(Scheduler):
                 self._inflight[j.tenant_id],
                 j.arrival_time, j.job_id,
             ))
-        # Spread across partitions: prefer the ones that can admit the job now,
-        # least-loaded first (shortest queue, then most admission headroom). If
-        # none currently fits, propose the least-loaded anyway so the admission
-        # controller rules on it (QUEUE to retry later, or REJECT outright).
-        fitting = [p for p in partitions if job.mem_mb <= admit_headroom(p)]
-        pool = fitting or partitions
-        best = min(pool, key=lambda p: (p["queue_len"], -admit_headroom(p),
-                                        p["index"]))
-        return job, best["index"]
+        # Spread across partitions: fill a never-used GPU first, else the
+        # least-loaded partition that can admit the job now (shortest queue,
+        # then most admission headroom). If none currently fits, the roomiest
+        # is proposed anyway so the admission controller rules on it (QUEUE to
+        # retry later, or REJECT outright).
+        return job, self._spread.place(job, partitions)

@@ -6,17 +6,19 @@ VRAM demand (first-fit by partition index). No other job property -- priority,
 size, tenant -- influences the order, which is what makes FCFS the baseline
 the other two policies are compared against.
 
-When no partition can currently take the job, it is proposed on the roomiest
-one anyway so the admission controller rules on it: QUEUE holds it (it stays
-at the head of the queue and is retried first on every later pass), REJECT
-removes a demand that could never fit. Jobs behind a held job may still be
-offered later in the same pass -- ordering is queue-order-level only, with no
-preemption of anything running.
+Placement spreads across GPUs: the job is sent to an idle server not yet used
+this run (filling every GPU before any is reused), else to the least-loaded
+one that can admit it. When no partition can currently take the job it is
+proposed on the roomiest one anyway so the admission controller rules on it:
+QUEUE holds it (it stays at the head of the queue and is retried first on
+every later pass), REJECT removes a demand that could never fit. Jobs behind a
+held job may still be offered later in the same pass -- ordering is
+queue-order-level only, with no preemption of anything running.
 
 See Scheduling_control/scheduler.py for the contract.
 """
 
-from Scheduling_control.scheduler import Scheduler, first_fit
+from Scheduling_control.scheduler import Scheduler, ServerSpread
 
 
 class FCFSScheduler(Scheduler):
@@ -24,10 +26,17 @@ class FCFSScheduler(Scheduler):
 
     NAME = "FCFS (first-come-first-served)"
 
+    def __init__(self):
+        # Spreads placements across never-used GPUs first (single global queue).
+        self._spread = ServerSpread()
+
+    def job_placed(self, job, partition_index):
+        self._spread.note_placed(partition_index)
+
     def select(self, pending_jobs, partitions):
         if not pending_jobs or not partitions:
             return None
         # Oldest arrival first; job_id breaks the (rare) exact-time tie, since
         # trace ids are assigned in arrival order.
         job = min(pending_jobs, key=lambda j: (j.arrival_time, j.job_id))
-        return job, first_fit(job, partitions)
+        return job, self._spread.place(job, partitions)

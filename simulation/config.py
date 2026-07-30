@@ -26,7 +26,8 @@ subjected to the same workload".
 import json
 from dataclasses import asdict, dataclass, field
 
-from Workload.workload import DEFAULT_ARRIVAL_RATE, build_experiment
+from Workload.workload import (DEFAULT_ARRIVAL_RATE, DEFAULT_ITER_MULTIPLIER,
+                               build_experiment)
 
 # The canonical workload-mix keys, in light->medium->heavy order (matches
 # Workload.workload.WORKLOAD_TYPES).
@@ -50,6 +51,9 @@ class ExperimentConfig:
     counts: dict = field(default_factory=_default_counts)
     # Mean jobs per second per tenant (§3.8 ii).
     arrival_rate: float = DEFAULT_ARRIVAL_RATE
+    # Whole-experiment scale on every job's matmul iteration count (§3.8 i):
+    # 1 = the workload-type ranges as-is, N = N x the compute per job.
+    iter_multiplier: int = DEFAULT_ITER_MULTIPLIER
     # Equal-slice partition count (§3.8 iii); the engine splits physical VRAM.
     num_partitions: int = 3
     # Admission threshold as a fraction of each partition's cap (§3.8 iv).
@@ -81,6 +85,9 @@ class ExperimentConfig:
             raise ValueError("counts must include at least one job per tenant")
         if self.arrival_rate <= 0:
             raise ValueError(f"arrival_rate must be > 0: {self.arrival_rate}")
+        if int(self.iter_multiplier) < 1:
+            raise ValueError(
+                f"iter_multiplier must be >= 1: {self.iter_multiplier}")
         if self.num_partitions < 1:
             raise ValueError(f"num_partitions must be >= 1: {self.num_partitions}")
         if not 0.0 < self.threshold_pct <= 1.0:
@@ -96,10 +103,14 @@ class ExperimentConfig:
         scheduler): one results directory per condition, holding one run per
         scheduler underneath."""
         mix = "-".join(str(int(self.counts.get(k, 0))) for k in MIX_KEYS)
+        # The iteration multiplier only enters the label when it is non-default,
+        # so existing conditions keep their established directory names.
+        iterx = (f"_iterx{int(self.iter_multiplier)}"
+                 if int(self.iter_multiplier) != 1 else "")
         return (f"mix{mix}_tenants{self.num_tenants}"
                 f"_rate{self.arrival_rate:g}_parts{self.num_partitions}"
                 f"_thr{int(round(self.threshold_pct * 100))}"
-                f"_margin{self.safety_margin_mb}_seed{self.seed}")
+                f"_margin{self.safety_margin_mb}{iterx}_seed{self.seed}")
 
     def scheduler_slug(self):
         """Filesystem-safe form of the scheduler display name."""
@@ -112,7 +123,8 @@ class ExperimentConfig:
         scheduler under this config is subjected to."""
         counts = {k: int(self.counts.get(k, 0)) for k in MIX_KEYS}
         return build_experiment(self.num_tenants, counts, self.seed,
-                                arrival_rate=self.arrival_rate)
+                                arrival_rate=self.arrival_rate,
+                                iter_multiplier=int(self.iter_multiplier))
 
     # ---- (de)serialization ----------------------------------------------------
     def to_dict(self):

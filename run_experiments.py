@@ -164,6 +164,9 @@ def main(argv=None):
                         metavar="MB", help="admission safety margin (MB)")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0],
                         metavar="SEED", help="trace seeds")
+    parser.add_argument("--iter-multiplier", type=int, default=1, metavar="N",
+                        help="scale every job's matmul iteration count by N "
+                             "(compute-intensity knob; memory/arrivals unchanged)")
     parser.add_argument("--schedulers", nargs="+", default=None, metavar="NAME",
                         help="scheduler name fragments (case-insensitive "
                              "substring of the plugin display name); default: "
@@ -202,7 +205,8 @@ def main(argv=None):
     for mix, rate, parts, thr, margin, seed in grid:
         base = dict(num_tenants=args.tenants, counts=mix, arrival_rate=rate,
                     num_partitions=parts, threshold_pct=thr,
-                    safety_margin_mb=margin, seed=seed)
+                    safety_margin_mb=margin, seed=seed,
+                    iter_multiplier=args.iter_multiplier)
         cond_label = ExperimentConfig(**base).condition_label()
         for name, cls in schedulers.items():
             run_no += 1
